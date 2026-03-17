@@ -1621,17 +1621,19 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
             _packed_comps.append((parts[0], parts[1], comp["offset"], comp["size"],
                                   np_dtype, tuple(comp["shape"]), is_bf16))
 
-    # === fast_weight_load C extension: pre-allocated Metal buffers + parallel pread ===
-    _fwl_buffers = None
+    # === fast_moe_load C extension: pre-stacked Metal buffers + parallel pread ===
+    # Uses fast_moe_load which returns pre-stacked [K, *shape] buffers per (layer, component).
+    # Eliminates 540 mx.stack() calls per token (60 layers x 9 components).
+    _fwl_buffers = None  # list of layer_dicts: [{comp_name: mx.array[K, ...]}, ...]
     _fwl_active = False
     if fast_load and single_eval and packed_layout is not None:
         try:
-            import fast_weight_load
+            import fast_moe_load as _fwl_module
             # Map layout dtype strings to MLX dtype attribute names
             _fwl_dtype_map = {
                 'U32': 'uint32',
                 'F32': 'float32',
-                'BF16': 'uint16',  # read as uint16, .view(mx.bfloat16) at use time
+                'BF16': 'uint16',  # stored as uint16, fast_moe_load returns bfloat16 view
                 'F16': 'float16',
                 'I32': 'int32',
             }
@@ -1644,26 +1646,27 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                     'size': comp['size'],
                     'shape': comp['shape'],
                     'dtype': _fwl_dtype_map[comp['dtype']],
+                    'needs_bf16_view': comp['dtype'] == 'BF16',
                 })
 
             packed_dir = str(Path(model_path) / "packed_experts")
             expert_size = packed_layout["expert_size"]
 
-            fast_weight_load.init(num_workers=8)
-            _fwl_buffers = fast_weight_load.prealloc(
+            _fwl_module.init(num_workers=8)
+            _fwl_buffers = _fwl_module.prealloc_stacked(
                 num_layers, active_experts, _fwl_components,
                 packed_dir, expert_size)
             _fwl_active = True
 
             import atexit as _fwl_atexit
-            _fwl_atexit.register(fast_weight_load.shutdown)
+            _fwl_atexit.register(_fwl_module.shutdown)
 
-            print(f"  [fast-load] C extension initialized: {num_layers} layers x "
+            print(f"  [fast-load] fast_moe_load initialized: {num_layers} layers x "
                   f"{active_experts} slots x {len(_fwl_components)} components. "
-                  f"Pre-allocated Metal buffers for zero-copy pread.")
+                  f"Pre-stacked Metal buffers (zero mx.stack overhead).")
         except ImportError:
-            print(f"  [fast-load] DISABLED — fast_weight_load.so not found. "
-                  f"Build with: python setup_fwl.py build_ext --inplace")
+            print(f"  [fast-load] DISABLED — fast_moe_load.so not found. "
+                  f"Build with: python setup_cext.py build_ext --inplace")
         except Exception as e:
             print(f"  [fast-load] DISABLED — init failed: {e}")
     elif fast_load:
@@ -1796,7 +1799,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         print(f"  [two-pass] DISABLED — requires: {', '.join(missing)}")
     elif use_two_pass:
         if single_eval:
-            _se_io_label = "fast_weight_load C ext (parallel pread into Metal buffers)" if _fwl_active else "pre-read superset"
+            _se_io_label = "fast_moe_load C ext (parallel pread into pre-stacked Metal buffers)" if _fwl_active else "pre-read superset"
             print(f"  [two-pass+single-eval] Pass 1 = routing scout (2x superset + top-K), "
                   f"Batch I/O = {_se_io_label}, Pass 2 = FULLY LAZY expert compute "
                   f"(single mx.eval for all {num_layers} layers). No per-layer routing eval.")
@@ -2075,13 +2078,21 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                 _se_io_total = 0.0
                 _se_convert_total = 0.0
 
-                # ---- FAST-LOAD PATH: batch all expert I/O via C extension ----
+                # ---- FAST-LOAD PATH: batch all expert I/O via fast_moe_load ----
                 # Build routing decisions for ALL layers first, then dispatch
-                # one C call to fill all pre-allocated Metal buffers in parallel.
+                # one C call to fill pre-stacked Metal buffers in parallel.
+                # fast_moe_load returns pre-stacked [K, *shape] tensors per
+                # (layer, component) — no Python mx.stack() calls needed.
                 if _fwl_active:
-                    # Pre-compute routing for all MoE layers
-                    _fwl_routing = {}  # layer_idx -> (unique_list, remap, remapped_inds, scores_topk_i)
-                    _fwl_load_list = []
+                    # Pre-compute routing for all MoE layers.
+                    # Key invariant: buffer slot N holds the expert whose
+                    # remap index is N. np.unique returns sorted expert IDs,
+                    # so unique_list[j] -> slot j, and remap[unique_list[j]] = j.
+                    # fast_moe_load.load_and_assemble fills slot si with
+                    # expert_list[si], preserving this order.
+                    _fwl_routing = {}  # layer_idx -> (num_unique, remapped_inds, scores_topk_i)
+                    _fwl_load_routing = []  # [(layer_idx, sorted_unique_experts), ...]
+                    _fwl_total_experts = 0
 
                     for i in range(num_layers):
                         if i not in all_superset_info:
@@ -2092,16 +2103,24 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                         layer = layers[i]
 
                         inds_np = np.array(inds_topk_i.tolist())
-                        unique_experts = np.unique(inds_np)
+                        unique_experts = np.unique(inds_np)  # sorted
                         num_unique = len(unique_experts)
                         unique_list = unique_experts.tolist()
 
-                        # Build remap table
+                        # Build remap table: maps original expert IDs to
+                        # indices 0..num_unique-1 matching the sorted order.
+                        # unique_list[j] maps to slot j in the stacked buffer.
                         remap = np.zeros(layer.mlp.num_experts, dtype=np.int32)
                         remap[unique_experts] = np.arange(num_unique)
                         remapped_inds = mx.array(remap[inds_np])
 
-                        _fwl_routing[i] = (unique_list, remap, remapped_inds, scores_topk_i)
+                        _fwl_routing[i] = (num_unique, remapped_inds, scores_topk_i)
+
+                        # Build routing for fast_moe_load.load_and_assemble.
+                        # The C extension fills slot si with expert_list[si],
+                        # so sorted unique_list ensures slot order matches remap.
+                        _fwl_load_routing.append((i, unique_list))
+                        _fwl_total_experts += num_unique
 
                         # Track routing
                         _token_routing[i] = unique_list
@@ -2109,24 +2128,21 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                             for eidx in unique_list:
                                 pin_counts[i, eidx] += 1
 
-                        # Build load_list: (layer, expert_idx, slot)
-                        for slot, eidx in enumerate(unique_list):
-                            if slot < active_experts:
-                                _fwl_load_list.append((i, eidx, slot))
-
-                    # Dispatch ALL expert reads in one C call (parallel pread into Metal buffers)
+                    # Dispatch ALL expert reads in one C call
+                    # (parallel pread into pre-stacked Metal buffers)
                     _t_io = time.perf_counter()
-                    if _fwl_load_list:
-                        import fast_weight_load
-                        fast_weight_load.load_experts(_fwl_load_list)
+                    if _fwl_load_routing:
+                        _fwl_module.load_and_assemble(_fwl_load_routing)
                     _se_io_total = time.perf_counter() - _t_io
 
                     # Track I/O stats
-                    token_io_seeks += len(_fwl_load_list)
-                    token_io_bytes += len(_fwl_load_list) * es
-                    _ss_hits = len(_fwl_load_list)
+                    token_io_seeks += _fwl_total_experts
+                    token_io_bytes += _fwl_total_experts * es
+                    _ss_hits = _fwl_total_experts
 
-                    # Build computation graph using pre-filled Metal buffers
+                    # Build computation graph using pre-stacked Metal buffers.
+                    # _fwl_buffers[layer_idx] is a dict {comp_name: mx.array[K, *shape]}
+                    # already filled by load_and_assemble — no mx.stack needed.
                     _t_conv_start = time.perf_counter()
                     for i in range(num_layers):
                         if i not in all_superset_info:
@@ -2139,7 +2155,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                                 h = h + r
                             continue
 
-                        unique_list, remap, remapped_inds, scores_topk_i = _fwl_routing[i]
+                        num_unique, remapped_inds, scores_topk_i = _fwl_routing[i]
                         layer = layers[i]
                         c = cache[i]
 
@@ -2151,21 +2167,28 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                         h_post = layer.post_attention_layernorm(h_mid)
 
-                        # Build expert_tensors from pre-allocated C extension buffers
+                        # Use pre-stacked buffers from fast_moe_load directly.
+                        # Each buffer is [K, *shape]; slice to [:num_unique].
+                        #
+                        # CRITICAL: The buffers were mx.eval'd as zeros at prealloc
+                        # time, then pread overwrote the Metal buffer contents.
+                        # We must create new graph nodes so MLX reads from the
+                        # buffer at eval time instead of using cached zeros.
+                        # .view(different_dtype).view(original_dtype) forces this.
                         layer_bufs = _fwl_buffers[i]
                         expert_tensors = {}
-                        for proj_name in ["gate_proj", "up_proj", "down_proj"]:
-                            for attr_name in ["weight", "scales", "biases"]:
-                                comp_name = f"{proj_name}.{attr_name}"
-                                slices = []
-                                for slot, eidx in enumerate(unique_list):
-                                    if slot < active_experts:
-                                        arr = layer_bufs[slot][comp_name]
-                                        if 'scales' in comp_name or 'biases' in comp_name:
-                                            arr = arr.view(mx.bfloat16)
-                                        slices.append(arr)
-                                if slices:
-                                    expert_tensors[comp_name] = mx.stack(slices, axis=0)
+                        for comp_name, stacked_arr in layer_bufs.items():
+                            sliced = stacked_arr[:num_unique]
+                            if stacked_arr.dtype == mx.bfloat16:
+                                # BF16 scales/biases: round-trip through uint16
+                                expert_tensors[comp_name] = sliced.view(mx.uint16).view(mx.bfloat16)
+                            elif stacked_arr.dtype == mx.uint32:
+                                # Quantized weights: round-trip through float32
+                                expert_tensors[comp_name] = sliced.view(mx.float32).view(mx.uint32)
+                            else:
+                                # Fallback: identity view (should not occur for
+                                # standard quantized models)
+                                expert_tensors[comp_name] = sliced.view(sliced.dtype)
 
                         # Compute MoE (LAZY — no eval)
                         y = compute_moe_direct(
@@ -2195,7 +2218,7 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
                         })
 
                     _se_convert_total = time.perf_counter() - _t_conv_start
-                    del _fwl_routing, _fwl_load_list
+                    del _fwl_routing, _fwl_load_routing
 
                 else:
                     # ---- ORIGINAL PATH: Python pread + np.frombuffer + mx.array ----
@@ -5425,11 +5448,11 @@ def main():
                              "Quality trade-off: uses approximate routing from Pass 1 instead of "
                              "correct routing with corrected h. Requires --two-pass.")
     parser.add_argument("--fast-load", action="store_true", default=False,
-                        help="Use fast_weight_load C extension for expert I/O in single-eval mode. "
-                             "Pre-allocates Metal buffers at startup and fills them via parallel "
-                             "pread() directly into GPU memory (no np.frombuffer + mx.array overhead). "
-                             "Reduces I/O+convert from ~191ms to ~39ms. "
-                             "Requires --single-eval --two-pass and compiled fast_weight_load.so.")
+                        help="Use fast_moe_load C extension for expert I/O in single-eval mode. "
+                             "Pre-allocates STACKED Metal buffers [K, *shape] at startup and fills "
+                             "them via parallel pread() directly into GPU memory. Eliminates both "
+                             "np.frombuffer overhead AND 540 mx.stack() calls per token. "
+                             "Requires --single-eval --two-pass and compiled fast_moe_load.so.")
     args = parser.parse_args()
 
     # Validate --cache-gb range

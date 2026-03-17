@@ -38,6 +38,7 @@ fast_weight_load = Extension(
 fast_moe_load = Extension(
     'fast_moe_load',
     sources=['fast_moe_load.c'],
+    include_dirs=[np.get_include()],
     extra_compile_args=[
         '-O3',
         '-march=armv8.4-a',
@@ -52,7 +53,9 @@ fast_moe_load = Extension(
 
 setup(
     name='ane_research_cext',
-    version='0.3.0',
+    version='0.4.0',
     description='High-throughput expert weight I/O C extensions',
     ext_modules=[fast_expert_io, fast_weight_load, fast_moe_load],
+    py_modules=[],
+    packages=[],
 )
