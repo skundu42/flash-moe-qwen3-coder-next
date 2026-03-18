@@ -232,7 +232,8 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
 #define ANSI_BOLD    "\033[1m"
 #define ANSI_ITALIC  "\033[3m"
 #define ANSI_CODE    "\033[36m"      // cyan for inline code
-#define ANSI_CODEBLK "\033[48;5;236m\033[38;5;252m"  // dark bg + light fg for code blocks
+#define ANSI_CODEBLK "\033[48;5;236m\033[38;5;252m"  // dark bg + light fg
+#define ANSI_CODEBLK_LINE "\033[48;5;236m\033[K"     // extend bg to end of line
 #define ANSI_HEADER  "\033[1;34m"    // bold blue for headers
 #define ANSI_DIM     "\033[2m"
 
@@ -241,6 +242,7 @@ typedef struct {
     int italic;      // inside *...*
     int code_inline; // inside `...`
     int code_block;  // inside ```...```
+    int skip_lang;   // eating language tag after opening ```
     int line_start;  // at start of a new line
     char pending[8]; // buffered chars for lookahead (e.g., partial "**")
     int pending_len;
@@ -257,26 +259,37 @@ static void md_print(const char *text) {
     for (int i = 0; text[i]; i++) {
         char c = text[i];
 
-        // Code block toggle: ```
-        if (c == '`' && text[i+1] == '`' && text[i+2] == '`') {
-            if (g_md.code_block) {
-                printf(ANSI_RESET);
-                g_md.code_block = 0;
-            } else {
-                printf(ANSI_CODEBLK);
-                g_md.code_block = 1;
+        // Skip language tag after opening ``` (may span tokens)
+        if (g_md.skip_lang) {
+            if (c == '\n') {
+                g_md.skip_lang = 0;
+                printf(ANSI_CODEBLK ANSI_CODEBLK_LINE "\n");
             }
-            i += 2;
-            // Skip optional language tag on opening
-            if (g_md.code_block) {
-                while (text[i+1] && text[i+1] != '\n') i++;
-            }
+            // else: eat the character (language tag)
             continue;
         }
 
-        // Inside code block: print verbatim
+        // Code block toggle: ```
+        if (c == '`' && text[i+1] == '`' && text[i+2] == '`') {
+            if (g_md.code_block) {
+                printf(ANSI_RESET "\n");
+                g_md.code_block = 0;
+            } else {
+                g_md.code_block = 1;
+                g_md.skip_lang = 1;  // eat language tag until newline
+            }
+            i += 2;
+            continue;
+        }
+
+        // Inside code block: print with full-width background
         if (g_md.code_block) {
-            putchar(c);
+            printf(ANSI_CODEBLK);
+            if (c == '\n') {
+                printf(ANSI_CODEBLK_LINE "\n");
+            } else {
+                putchar(c);
+            }
             continue;
         }
 
@@ -298,11 +311,11 @@ static void md_print(const char *text) {
             continue;
         }
 
-        // Headers at line start: # ## ###
+        // Headers at line start: # ## ### — hide markers, show text bold blue
         if (g_md.line_start && c == '#') {
+            while (text[i] == '#') i++;  // skip all #
+            while (text[i] == ' ') i++;  // skip space after #
             printf(ANSI_HEADER);
-            while (text[i] == '#') { putchar(text[i]); i++; }
-            // Print rest of header line
             while (text[i] && text[i] != '\n') { putchar(text[i]); i++; }
             printf(ANSI_RESET);
             if (text[i] == '\n') { putchar('\n'); g_md.line_start = 1; }
