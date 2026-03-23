@@ -251,11 +251,9 @@ for bring-up and accuracy debugging.
 
 It writes:
 - prompt token ids
+- prompt context metadata for tokenizer-parity checks
 - the last prompt-token embedding
-- per-layer `h_post`
-- per-layer raw router logits
-- per-layer top-k routing
-- per-layer shared expert pre-gate output
+- selected per-layer attention / routing / shared-expert checkpoints
 - final hidden state after final norm
 - final logits
 
@@ -270,18 +268,30 @@ export QWEN3_CODER_NEXT_MODEL_PATH=/Users/sk/dev/flash-moe/Qwen3-Coder-Next
   --prompt "Write a Python function that reverses a linked list." \
   --tokens 1 \
   --k 10 \
-  --dump-dir /tmp/qwen3-next-dump
+  --dump-dir /tmp/qwen3-next-dump \
+  --dump-layers 0,1,47 \
+  --dump-stages embedding,attn,router,shared,final
 ```
 
 Expected output files include names like:
 
 ```text
 /tmp/qwen3-next-dump/prompt_tokens.json
+/tmp/qwen3-next-dump/prompt_context.json
 /tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__embedding.bin
 /tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__final_hidden.bin
 /tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__logits.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_attn_norm_in.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_post_attn_residual.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_post_attn_norm.bin
 /tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_router_logits.bin
 /tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_topk.json
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_shared_gate.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_shared_up.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_shared_swiglu.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_shared_down_pre_gate.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_moe_sum_pre_residual.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_layer_out.bin
 ```
 
 ## 11. Compare Runtime Dumps Against Source BF16 Tensors
@@ -291,9 +301,13 @@ only the source tensors needed for the dumped checkpoints.
 
 Current comparisons:
 - last-token embedding
-- per-layer router logits
-- per-layer router top-k overlap
-- per-layer shared expert pre-gate output
+- tokenizer parity when `prompt_context.json` is present and `transformers` is available
+- per-layer attention input norm
+- per-layer post-attention residual and norm
+- per-layer router logits and exact top-k routing
+- per-layer shared gate / up / SwiGLU / down-proj path
+- per-layer routed MoE sum before residual
+- per-layer final layer output
 - final logits from dumped final hidden state
 
 Example:
@@ -307,9 +321,21 @@ python3 /Users/sk/dev/flash-moe/tools/reference_compare.py \
 ```
 
 This prints per-checkpoint error summaries and writes a JSON report if
-`--output` is provided.
+`--output` is provided. The command exits nonzero on the earliest threshold
+failure, so it can be used as a regression gate.
 
-## 12. Run OpenAI-Compatible Server Mode
+## 12. Run The Canned Validation Suite
+
+```bash
+python3 /Users/sk/dev/flash-moe/tools/validate_qwen3_next_runtime.py \
+  --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+  --output /tmp/qwen3-next-validation.json
+```
+
+This runs a small set of plain-text, tool-envelope, and JSON prompts, captures
+runtime output, and runs `reference_compare.py` on the first pass of each prompt.
+
+## 13. Run OpenAI-Compatible Server Mode
 
 ```bash
 cd /Users/sk/dev/flash-moe/metal_infer

@@ -205,6 +205,7 @@ def qwen3_next_extract(args: argparse.Namespace) -> int:
     runtime_config["model_type"] = "qwen3_next"
     runtime_config["source_model"] = str(model_root)
     runtime_config["quantization"] = {"bits": 4, "scheme": "affine", "group_size": args.group_size}
+    runtime_config["high_precision_moe_layers"] = args.high_precision_moe_layers
 
     plan = build_qwen3_next_conversion_plan(runtime_config)
     output_dir = Path(args.output)
@@ -284,6 +285,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-experts", action="store_true", help="Legacy mode only: also extract expert weights")
     parser.add_argument("--summary", type=str, default=None, help="Optional inspection summary JSON with runtime_config_candidate")
     parser.add_argument("--group-size", type=int, default=64, help="qwen3-next q4 group size")
+    parser.add_argument(
+        "--high-precision-moe-layers",
+        type=int,
+        default=2,
+        help="qwen3-next: keep the first N layers of MoE gate/shared tensors in BF16",
+    )
     return parser.parse_args()
 
 

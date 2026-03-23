@@ -100,6 +100,26 @@ make infer
 ./infer --model "$QWEN3_CODER_NEXT_MODEL_PATH" --prompt "Hello" --tokens 16 --k 10
 ```
 
+Debug and compare:
+
+```bash
+./infer \
+  --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+  --prompt "Hello" \
+  --tokens 1 \
+  --k 10 \
+  --dump-dir /tmp/qwen3-next-dump \
+  --dump-layers 0,1,47 \
+  --dump-stages embedding,attn,router,shared,final
+```
+
+```bash
+python3 tools/reference_compare.py \
+  --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+  --dump-dir /tmp/qwen3-next-dump \
+  --layers 0,1,47
+```
+
 For the full operator flow, use [RUN_QWEN3_CODER_NEXT.md](RUN_QWEN3_CODER_NEXT.md).
 
 ## Project Structure
@@ -118,6 +138,8 @@ metal_infer/
 tools/
   inspect_qwen3_coder_next.py
   model_metadata.py
+  reference_compare.py       # dump-vs-BF16 first-failure oracle
+  validate_qwen3_next_runtime.py  # canned plain-text / tool / JSON validation
   q4_affine.py
   qwen3_next_adapter.py
   verify_packed_weights.py

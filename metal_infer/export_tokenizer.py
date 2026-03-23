@@ -47,6 +47,22 @@ def parse_args():
     return parser.parse_args()
 
 
+def normalize_merges(raw_merges):
+    merges = []
+    for idx, pair in enumerate(raw_merges):
+        if isinstance(pair, str):
+            parts = pair.split(" ", 1)
+            if len(parts) != 2:
+                raise ValueError(f"Invalid merge entry at index {idx}: {pair!r}")
+            a, b = parts
+        elif isinstance(pair, (list, tuple)) and len(pair) == 2:
+            a, b = pair
+        else:
+            raise ValueError(f"Unsupported merge entry at index {idx}: {pair!r}")
+        merges.append((a, b))
+    return merges
+
+
 def write_tokenizer_bin(out_path, sorted_vocab, merges, added):
     with open(out_path, 'wb') as f:
         f.write(b'BPET')
@@ -61,8 +77,7 @@ def write_tokenizer_bin(out_path, sorted_vocab, merges, added):
             f.write(struct.pack('<H', len(token_bytes)))
             f.write(token_bytes)
 
-        for pair in merges:
-            a, b = pair[0], pair[1]
+        for a, b in merges:
             a_bytes = a.encode('utf-8')
             b_bytes = b.encode('utf-8')
             f.write(struct.pack('<H', len(a_bytes)))
@@ -77,17 +92,70 @@ def write_tokenizer_bin(out_path, sorted_vocab, merges, added):
             f.write(token_bytes)
 
 
-def write_vocab_bin(out_path, sorted_vocab):
-    max_id = sorted_vocab[-1][1] if sorted_vocab else 0
+def build_byte_unicode_table():
+    byte_char = {}
+    n = 0
+    for b in range(256):
+        if (0x21 <= b <= 0x7E) or (0xA1 <= b <= 0xAC) or (0xAE <= b <= 0xFF):
+            byte_char[b] = chr(b)
+        else:
+            byte_char[b] = chr(256 + n)
+            n += 1
+    return byte_char
+
+
+BYTE_UNICODE = build_byte_unicode_table()
+UNICODE_BYTE = {v: k for k, v in BYTE_UNICODE.items()}
+
+
+def decode_base_vocab_token(token_str):
+    raw = bytearray()
+    for ch in token_str:
+        b = UNICODE_BYTE.get(ch)
+        if b is None:
+            # Already a normal codepoint not produced by the GPT-2 byte map.
+            raw.extend(ch.encode("utf-8"))
+        else:
+            raw.append(b)
+    return raw.decode("utf-8", errors="replace")
+
+
+def build_full_decode_table(sorted_vocab, added):
+    max_base_id = sorted_vocab[-1][1] if sorted_vocab else -1
+    max_added_id = max((tok["id"] for tok in added), default=-1)
+    max_id = max(max_base_id, max_added_id)
     contiguous = [None] * (max_id + 1)
+
     for token_str, token_id in sorted_vocab:
         if token_id < 0:
             raise ValueError(f"Negative token id: {token_id}")
+        decoded = decode_base_vocab_token(token_str)
+        if contiguous[token_id] is not None and contiguous[token_id] != decoded:
+            raise ValueError(f"Conflicting base vocab entry for id {token_id}")
+        contiguous[token_id] = decoded
+
+    for tok in added:
+        token_id = tok["id"]
+        token_str = tok["content"]
+        if token_id < 0:
+            raise ValueError(f"Negative added token id: {token_id}")
+        if contiguous[token_id] is not None and contiguous[token_id] != token_str:
+            raise ValueError(
+                f"Conflicting added token entry for id {token_id}: "
+                f"{contiguous[token_id]!r} vs {token_str!r}"
+            )
         contiguous[token_id] = token_str
+
     missing = [i for i, token_str in enumerate(contiguous) if token_str is None]
     if missing:
         preview = ", ".join(str(x) for x in missing[:8])
         raise ValueError(f"Tokenizer vocab has gaps; cannot write vocab.bin. Missing ids: {preview}")
+    return contiguous
+
+
+def write_vocab_bin(out_path, sorted_vocab, added):
+    contiguous = build_full_decode_table(sorted_vocab, added)
+    max_id = len(contiguous) - 1
 
     with open(out_path, 'wb') as f:
         f.write(struct.pack('<I', len(contiguous)))
@@ -110,20 +178,23 @@ def main():
 
     model = t['model']
     vocab = model['vocab']       # str -> int
-    merges = model['merges']     # list of [str, str]
+    merges = normalize_merges(model['merges'])
     added = t['added_tokens']    # list of {id, content, special, ...}
 
     # Sort vocab by token_id
     sorted_vocab = sorted(vocab.items(), key=lambda x: x[1])
 
+    full_decode_table = build_full_decode_table(sorted_vocab, added)
+
     write_tokenizer_bin(tokenizer_out, sorted_vocab, merges, added)
-    write_vocab_bin(vocab_out, sorted_vocab)
+    write_vocab_bin(vocab_out, sorted_vocab, added)
 
     print("Export complete:")
     print(f"  tokenizer.json: {tok_path}")
     print(f"  tokenizer.bin:  {tokenizer_out} ({os.path.getsize(tokenizer_out) / 1024 / 1024:.1f} MB)")
     print(f"  vocab.bin:      {vocab_out} ({os.path.getsize(vocab_out) / 1024 / 1024:.1f} MB)")
-    print(f"  Vocab entries:  {len(sorted_vocab)}")
+    print(f"  Base vocab:     {len(sorted_vocab)}")
+    print(f"  Decode entries: {len(full_decode_table)}")
     print(f"  Merge rules:    {len(merges)}")
     print(f"  Added tokens:   {len(added)}")
 

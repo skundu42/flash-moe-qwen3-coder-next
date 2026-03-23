@@ -1049,7 +1049,7 @@ kernel void conv1d_step(
 // Kernel 12: Per-head RMS normalize for q and k vectors
 // ============================================================================
 // q: [num_k_heads * key_dim], k: [num_k_heads * key_dim]
-// Normalize each head independently, then scale by 1/sqrt(key_dim)^2 for q, 1/sqrt(key_dim) for k
+// Normalize each head independently with L2 norm, then scale only q by 1/sqrt(key_dim)
 // Dispatch: num_k_heads threadgroups, key_dim threads each
 
 kernel void rms_norm_qk(
@@ -1080,9 +1080,9 @@ kernel void rms_norm_qk(
         q_sum_sq = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float q_inv_rms = rsqrt(q_sum_sq / float(key_dim) + 1e-6f);
+    float q_inv_l2 = rsqrt(q_sum_sq + 1e-6f);
     if (tid < key_dim) {
-        q[base + tid] = qval * q_inv_rms * inv_scale * inv_scale;  // q gets extra scale
+        q[base + tid] = qval * q_inv_l2 * inv_scale;
     }
 
     // RMS norm for k
@@ -1097,9 +1097,9 @@ kernel void rms_norm_qk(
         k_sum_sq = s;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float k_inv_rms = rsqrt(k_sum_sq / float(key_dim) + 1e-6f);
+    float k_inv_l2 = rsqrt(k_sum_sq + 1e-6f);
     if (tid < key_dim) {
-        k[base + tid] = kval * k_inv_rms * inv_scale;
+        k[base + tid] = kval * k_inv_l2;
     }
 }
 

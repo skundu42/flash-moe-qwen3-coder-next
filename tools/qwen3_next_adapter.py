@@ -17,6 +17,7 @@ class TensorConversionSpec:
 
 def build_qwen3_next_conversion_plan(runtime_config: dict) -> List[TensorConversionSpec]:
     plan: List[TensorConversionSpec] = []
+    high_precision_moe_layers = int(runtime_config.get("high_precision_moe_layers", 0))
 
     def q(src: str, dst: str, row_range: Optional[Tuple[int, int]] = None) -> None:
         plan.append(TensorConversionSpec(src, dst, "quantize_matrix", row_range))
@@ -79,10 +80,17 @@ def build_qwen3_next_conversion_plan(runtime_config: dict) -> List[TensorConvers
             bf16(f"{prefix}.linear_attn.norm.weight", f"{prefix}.linear_attn.norm.weight")
             q(f"{prefix}.linear_attn.out_proj.weight", f"{prefix}.linear_attn.out_proj")
 
-        q(f"{prefix}.mlp.gate.weight", f"{prefix}.mlp.gate")
-        q(f"{prefix}.mlp.shared_expert.gate_proj.weight", f"{prefix}.mlp.shared_expert.gate_proj")
-        q(f"{prefix}.mlp.shared_expert.up_proj.weight", f"{prefix}.mlp.shared_expert.up_proj")
-        q(f"{prefix}.mlp.shared_expert.down_proj.weight", f"{prefix}.mlp.shared_expert.down_proj")
-        q(f"{prefix}.mlp.shared_expert_gate.weight", f"{prefix}.mlp.shared_expert_gate")
+        if layer_idx < high_precision_moe_layers:
+            bf16(f"{prefix}.mlp.gate.weight", f"{prefix}.mlp.gate.weight")
+            bf16(f"{prefix}.mlp.shared_expert.gate_proj.weight", f"{prefix}.mlp.shared_expert.gate_proj.weight")
+            bf16(f"{prefix}.mlp.shared_expert.up_proj.weight", f"{prefix}.mlp.shared_expert.up_proj.weight")
+            bf16(f"{prefix}.mlp.shared_expert.down_proj.weight", f"{prefix}.mlp.shared_expert.down_proj.weight")
+            bf16(f"{prefix}.mlp.shared_expert_gate.weight", f"{prefix}.mlp.shared_expert_gate.weight")
+        else:
+            q(f"{prefix}.mlp.gate.weight", f"{prefix}.mlp.gate")
+            q(f"{prefix}.mlp.shared_expert.gate_proj.weight", f"{prefix}.mlp.shared_expert.gate_proj")
+            q(f"{prefix}.mlp.shared_expert.up_proj.weight", f"{prefix}.mlp.shared_expert.up_proj")
+            q(f"{prefix}.mlp.shared_expert.down_proj.weight", f"{prefix}.mlp.shared_expert.down_proj")
+            q(f"{prefix}.mlp.shared_expert_gate.weight", f"{prefix}.mlp.shared_expert_gate")
 
     return plan

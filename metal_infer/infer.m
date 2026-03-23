@@ -853,6 +853,21 @@ static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
     return find_tensor(wf->manifest, name);
 }
 
+static float *materialize_bf16_matrix_f32(const uint16_t *src_bf16, const TensorInfo *info) {
+    if (!src_bf16 || !info || strcmp(info->dtype, "BF16") != 0 || info->ndim != 2) {
+        return NULL;
+    }
+    int rows = info->shape[0];
+    int cols = info->shape[1];
+    float *dst = malloc((size_t)rows * (size_t)cols * sizeof(float));
+    if (!dst) return NULL;
+    int total = rows * cols;
+    for (int i = 0; i < total; i++) {
+        dst[i] = bf16_to_f32(src_bf16[i]);
+    }
+    return dst;
+}
+
 // ============================================================================
 // Vocabulary for token decoding
 // ============================================================================
@@ -889,9 +904,15 @@ static Vocabulary *load_vocab(const char *path) {
     fread(&max_id, 4, 1, f);
 
     Vocabulary *v = calloc(1, sizeof(Vocabulary));
-    v->num_tokens = num_entries;
-    v->tokens = calloc(num_entries, sizeof(char *));
-    v->lengths = calloc(num_entries, sizeof(int));
+    uint32_t decode_slots = max_id + 1;
+    if (num_entries != decode_slots) {
+        fprintf(stderr,
+                "WARNING: vocab header count=%u does not match max_id+1=%u, using %u decode slots\n",
+                num_entries, decode_slots, decode_slots);
+    }
+    v->num_tokens = (int)decode_slots;
+    v->tokens = calloc(decode_slots, sizeof(char *));
+    v->lengths = calloc(decode_slots, sizeof(int));
 
     for (uint32_t i = 0; i < num_entries; i++) {
         uint16_t byte_len;
@@ -905,7 +926,7 @@ static Vocabulary *load_vocab(const char *path) {
     }
 
     fclose(f);
-    printf("[vocab] Loaded %d tokens\n", num_entries);
+    printf("[vocab] Loaded %u decode tokens (max_id=%u)\n", decode_slots, max_id);
     return v;
 }
 
@@ -942,6 +963,20 @@ static void init_runtime_special_tokens(Vocabulary *v) {
     tok = find_vocab_token_id(v, "</think>");
     if (tok >= 0) g_special_tokens.think_end_token = tok;
 
+    if (g_special_tokens.eos_token_1 >= v->num_tokens ||
+        g_special_tokens.eos_token_2 >= v->num_tokens ||
+        g_special_tokens.think_start_token >= v->num_tokens ||
+        g_special_tokens.think_end_token >= v->num_tokens) {
+        fprintf(stderr,
+                "WARNING: special token ids exceed loaded vocab range (%d): "
+                "eos=(%d,%d) think=(%d,%d)\n",
+                v->num_tokens,
+                g_special_tokens.eos_token_1,
+                g_special_tokens.eos_token_2,
+                g_special_tokens.think_start_token,
+                g_special_tokens.think_end_token);
+    }
+
     printf("[tokens] eos=(%d,%d) think=(%d,%d)\n",
            g_special_tokens.eos_token_1,
            g_special_tokens.eos_token_2,
@@ -958,6 +993,15 @@ typedef struct {
     int count;
 } PromptTokens;
 
+enum {
+    DUMP_STAGE_EMBEDDING = 1u << 0,
+    DUMP_STAGE_ATTN      = 1u << 1,
+    DUMP_STAGE_ROUTER    = 1u << 2,
+    DUMP_STAGE_SHARED    = 1u << 3,
+    DUMP_STAGE_FINAL     = 1u << 4,
+    DUMP_STAGE_ALL       = (1u << 5) - 1u,
+};
+
 typedef struct {
     int enabled;
     int step_active;
@@ -967,9 +1011,171 @@ typedef struct {
     char step_phase[64];
     int step_pos;
     int step_input_token;
+    uint32_t stage_mask;
+    int layer_ids[NUM_LAYERS];
+    int num_layer_ids;
 } RuntimeDumpState;
 
 static RuntimeDumpState g_runtime_dump = {0};
+
+static const char *runtime_dump_stage_name(uint32_t stage_bit) {
+    switch (stage_bit) {
+        case DUMP_STAGE_EMBEDDING: return "embedding";
+        case DUMP_STAGE_ATTN: return "attn";
+        case DUMP_STAGE_ROUTER: return "router";
+        case DUMP_STAGE_SHARED: return "shared";
+        case DUMP_STAGE_FINAL: return "final";
+        default: return "unknown";
+    }
+}
+
+static int runtime_dump_stage_bit_from_name(const char *name) {
+    if (!name) return 0;
+    if (strcmp(name, "embedding") == 0) return (int)DUMP_STAGE_EMBEDDING;
+    if (strcmp(name, "attn") == 0) return (int)DUMP_STAGE_ATTN;
+    if (strcmp(name, "router") == 0) return (int)DUMP_STAGE_ROUTER;
+    if (strcmp(name, "shared") == 0) return (int)DUMP_STAGE_SHARED;
+    if (strcmp(name, "final") == 0) return (int)DUMP_STAGE_FINAL;
+    return 0;
+}
+
+static int runtime_dump_stage_enabled(uint32_t stage_bit) {
+    return g_runtime_dump.enabled && (g_runtime_dump.stage_mask & stage_bit) != 0;
+}
+
+static int runtime_dump_layer_enabled(int layer_idx) {
+    if (!g_runtime_dump.enabled) return 0;
+    if (g_runtime_dump.num_layer_ids <= 0) return 1;
+    for (int i = 0; i < g_runtime_dump.num_layer_ids; i++) {
+        if (g_runtime_dump.layer_ids[i] == layer_idx) return 1;
+    }
+    return 0;
+}
+
+static void runtime_dump_add_layer_id(int layer_idx) {
+    if (layer_idx < 0 || layer_idx >= NUM_LAYERS) return;
+    for (int i = 0; i < g_runtime_dump.num_layer_ids; i++) {
+        if (g_runtime_dump.layer_ids[i] == layer_idx) return;
+    }
+    if (g_runtime_dump.num_layer_ids < NUM_LAYERS) {
+        g_runtime_dump.layer_ids[g_runtime_dump.num_layer_ids++] = layer_idx;
+    }
+}
+
+static int runtime_dump_parse_layers(const char *spec) {
+    if (!spec || !spec[0] || strcmp(spec, "all") == 0) {
+        g_runtime_dump.num_layer_ids = 0;
+        return 0;
+    }
+
+    char buf[512];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    g_runtime_dump.num_layer_ids = 0;
+
+    char *saveptr = NULL;
+    for (char *part = strtok_r(buf, ",", &saveptr);
+         part;
+         part = strtok_r(NULL, ",", &saveptr)) {
+        while (*part == ' ' || *part == '\t') part++;
+        if (!*part) continue;
+        char *dash = strchr(part, '-');
+        if (!dash) {
+            char *endptr = NULL;
+            long value = strtol(part, &endptr, 10);
+            if (!endptr || *endptr != '\0' || value < 0 || value >= NUM_LAYERS) {
+                fprintf(stderr, "WARNING: ignoring invalid dump layer %s\n", part);
+                continue;
+            }
+            runtime_dump_add_layer_id((int)value);
+            continue;
+        }
+
+        *dash = '\0';
+        char *endptr_a = NULL;
+        char *endptr_b = NULL;
+        long start = strtol(part, &endptr_a, 10);
+        long end = strtol(dash + 1, &endptr_b, 10);
+        if (!endptr_a || *endptr_a != '\0' || !endptr_b || *endptr_b != '\0' ||
+            start < 0 || end < start || end >= NUM_LAYERS) {
+            fprintf(stderr, "WARNING: ignoring invalid dump layer range %s-%s\n", part, dash + 1);
+            continue;
+        }
+        for (long value = start; value <= end; value++) {
+            runtime_dump_add_layer_id((int)value);
+        }
+    }
+    return 0;
+}
+
+static int runtime_dump_parse_stages(const char *spec) {
+    if (!spec || !spec[0] || strcmp(spec, "all") == 0) {
+        g_runtime_dump.stage_mask = DUMP_STAGE_ALL;
+        return 0;
+    }
+
+    char buf[256];
+    strncpy(buf, spec, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+    uint32_t mask = 0;
+    char *saveptr = NULL;
+    for (char *part = strtok_r(buf, ",", &saveptr);
+         part;
+         part = strtok_r(NULL, ",", &saveptr)) {
+        while (*part == ' ' || *part == '\t') part++;
+        if (!*part) continue;
+        int bit = runtime_dump_stage_bit_from_name(part);
+        if (!bit) {
+            fprintf(stderr, "WARNING: ignoring invalid dump stage %s\n", part);
+            continue;
+        }
+        mask |= (uint32_t)bit;
+    }
+    g_runtime_dump.stage_mask = mask ? mask : DUMP_STAGE_ALL;
+    return 0;
+}
+
+static void runtime_dump_print_config(void) {
+    if (!g_runtime_dump.enabled) return;
+    fprintf(stderr, "[dump] stages:");
+    for (uint32_t bit = 1; bit <= DUMP_STAGE_FINAL; bit <<= 1) {
+        if (g_runtime_dump.stage_mask & bit) {
+            fprintf(stderr, " %s", runtime_dump_stage_name(bit));
+        }
+    }
+    if (g_runtime_dump.num_layer_ids <= 0) {
+        fprintf(stderr, " | layers: all\n");
+        return;
+    }
+    fprintf(stderr, " | layers:");
+    for (int i = 0; i < g_runtime_dump.num_layer_ids; i++) {
+        fprintf(stderr, " %d", g_runtime_dump.layer_ids[i]);
+    }
+    fputc('\n', stderr);
+}
+
+static void runtime_dump_write_json_escaped(FILE *f, const char *value) {
+    fputc('"', f);
+    if (value) {
+        for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
+            switch (*p) {
+                case '\\': fputs("\\\\", f); break;
+                case '"': fputs("\\\"", f); break;
+                case '\n': fputs("\\n", f); break;
+                case '\r': fputs("\\r", f); break;
+                case '\t': fputs("\\t", f); break;
+                default:
+                    if (*p < 0x20) {
+                        fprintf(f, "\\u%04x", (unsigned)*p);
+                    } else {
+                        fputc(*p, f);
+                    }
+                    break;
+            }
+        }
+    }
+    fputc('"', f);
+}
 
 static int runtime_dump_ensure_dir(void) {
     if (!g_runtime_dump.enabled) return 0;
@@ -993,13 +1199,31 @@ static int runtime_dump_ensure_dir(void) {
 
 static void runtime_dump_enable(const char *dir) {
     if (!dir || !dir[0]) return;
+    uint32_t saved_stage_mask = g_runtime_dump.stage_mask ? g_runtime_dump.stage_mask : DUMP_STAGE_ALL;
+    int saved_num_layer_ids = g_runtime_dump.num_layer_ids;
+    int saved_layer_ids[NUM_LAYERS];
+    memcpy(saved_layer_ids, g_runtime_dump.layer_ids, sizeof(saved_layer_ids));
     memset(&g_runtime_dump, 0, sizeof(g_runtime_dump));
     strncpy(g_runtime_dump.dir, dir, sizeof(g_runtime_dump.dir) - 1);
     g_runtime_dump.enabled = 1;
+    g_runtime_dump.stage_mask = saved_stage_mask;
+    g_runtime_dump.num_layer_ids = saved_num_layer_ids;
+    memcpy(g_runtime_dump.layer_ids, saved_layer_ids, sizeof(saved_layer_ids));
     runtime_dump_ensure_dir();
     if (g_runtime_dump.enabled) {
         fprintf(stderr, "[dump] enabled: %s\n", g_runtime_dump.dir);
+        runtime_dump_print_config();
     }
+}
+
+static void runtime_dump_set_layers(const char *spec) {
+    runtime_dump_parse_layers(spec);
+    if (g_runtime_dump.enabled) runtime_dump_print_config();
+}
+
+static void runtime_dump_set_stages(const char *spec) {
+    runtime_dump_parse_stages(spec);
+    if (g_runtime_dump.enabled) runtime_dump_print_config();
 }
 
 static void runtime_dump_write_json_text(const char *path, const char *json_text) {
@@ -1034,15 +1258,22 @@ static void runtime_dump_write_f32_named(const char *name, const float *data, in
     runtime_dump_write_json_text(meta_path, meta_json);
 }
 
-static void runtime_dump_write_layer_f32(int layer_idx, const char *name, const float *data, int count) {
-    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+static void runtime_dump_write_f32_stage(uint32_t stage_bit, const char *name, const float *data, int count) {
+    if (!runtime_dump_stage_enabled(stage_bit)) return;
+    runtime_dump_write_f32_named(name, data, count);
+}
+
+static void runtime_dump_write_layer_f32_stage(int layer_idx, uint32_t stage_bit,
+                                               const char *name, const float *data, int count) {
+    if (!runtime_dump_stage_enabled(stage_bit) || !runtime_dump_layer_enabled(layer_idx)) return;
     char tensor_name[256];
     snprintf(tensor_name, sizeof(tensor_name), "layer_%02d_%s", layer_idx, name);
     runtime_dump_write_f32_named(tensor_name, data, count);
 }
 
-static void runtime_dump_write_layer_scalar(int layer_idx, const char *name, float value) {
-    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+static void runtime_dump_write_layer_scalar_stage(int layer_idx, uint32_t stage_bit,
+                                                  const char *name, float value) {
+    if (!runtime_dump_stage_enabled(stage_bit) || !runtime_dump_layer_enabled(layer_idx)) return;
     char path[1536], json_text[256];
     snprintf(path, sizeof(path), "%s/%s__layer_%02d_%s.json",
              g_runtime_dump.dir, g_runtime_dump.step_prefix, layer_idx, name);
@@ -1050,8 +1281,9 @@ static void runtime_dump_write_layer_scalar(int layer_idx, const char *name, flo
     runtime_dump_write_json_text(path, json_text);
 }
 
-static void runtime_dump_write_layer_topk(int layer_idx, const int *indices, const float *weights, int K) {
-    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+static void runtime_dump_write_layer_topk_stage(int layer_idx, uint32_t stage_bit,
+                                                const int *indices, const float *weights, int K) {
+    if (!runtime_dump_stage_enabled(stage_bit) || !runtime_dump_layer_enabled(layer_idx)) return;
     char path[1536];
     snprintf(path, sizeof(path), "%s/%s__layer_%02d_topk.json",
              g_runtime_dump.dir, g_runtime_dump.step_prefix, layer_idx);
@@ -1124,6 +1356,31 @@ static void runtime_dump_write_prompt_tokens(const PromptTokens *pt) {
     fputs("]\n}\n", f);
     fclose(f);
     g_runtime_dump.prompt_written = 1;
+}
+
+static void runtime_dump_write_prompt_context(const char *mode,
+                                              const char *user_text,
+                                              const char *system_text,
+                                              const char *full_text) {
+    if (!g_runtime_dump.enabled) return;
+    g_runtime_dump.prompt_written = 0;
+    char path[1536];
+    snprintf(path, sizeof(path), "%s/prompt_context.json", g_runtime_dump.dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "WARNING: failed to write prompt context %s\n", path);
+        return;
+    }
+    fputs("{\n  \"mode\": ", f);
+    runtime_dump_write_json_escaped(f, mode ? mode : "unknown");
+    fputs(",\n  \"user_text\": ", f);
+    runtime_dump_write_json_escaped(f, user_text ? user_text : "");
+    fputs(",\n  \"system_text\": ", f);
+    runtime_dump_write_json_escaped(f, system_text ? system_text : "");
+    fputs(",\n  \"full_text\": ", f);
+    runtime_dump_write_json_escaped(f, full_text ? full_text : "");
+    fputs("\n}\n", f);
+    fclose(f);
 }
 
 static PromptTokens *load_prompt_tokens(const char *path) {
@@ -2360,6 +2617,13 @@ static void fast_batch_matvec(
     }
 }
 
+static void cpu_f32_matvec(const float *W, const float *x, float *out, int out_dim, int in_dim) {
+    cblas_sgemv(CblasRowMajor, CblasNoTrans,
+                out_dim, in_dim,
+                1.0f, W, in_dim, x, 1,
+                0.0f, out, 1);
+}
+
 // ============================================================================
 // GPU expert forward: gate+up matvec -> SwiGLU -> down matvec
 // All 3 matmuls + activation in a single command buffer submission.
@@ -2582,6 +2846,14 @@ static void cpu_rms_norm_bare(const float *x, float *out, int dim, float eps) {
     for (int i = 0; i < dim; i++) out[i] = x[i] * inv_rms;
 }
 
+// L2 norm without weights (unit-length normalize)
+static void cpu_l2_norm_bare(const float *x, float *out, int dim, float eps) {
+    float sum_sq = 0.0f;
+    for (int i = 0; i < dim; i++) sum_sq += x[i] * x[i];
+    float inv_l2 = 1.0f / sqrtf(sum_sq + eps);
+    for (int i = 0; i < dim; i++) out[i] = x[i] * inv_l2;
+}
+
 // RMSNormGated: out = rms_norm(x) * silu(z)
 static void cpu_rms_norm_gated(const float *x, const float *z, const uint16_t *w_bf16,
                                 float *out, int dim, float eps) {
@@ -2705,23 +2977,19 @@ static void linear_attention_forward(
     float *lin_v = conv_out + 2 * LINEAR_TOTAL_KEY;  // rest = LINEAR_TOTAL_VALUE
 
     // ---- RMS normalize q and k (bare, no weights) ----
-    // q: scale = key_dim^(-0.5), normalize per head then scale by key_dim^(-1.0)
-    // Actually from the code:
-    //   inv_scale = k.shape[-1] ** -0.5 = head_k_dim^(-0.5) = 128^(-0.5)
-    //   q = (inv_scale**2) * rms_norm(q) = (1/128) * rms_norm(q)
-    //   k = inv_scale * rms_norm(k) = (1/sqrt(128)) * rms_norm(k)
+    // Qwen3-Next applies L2/RMS normalization to q and k, then scales only q by
+    // 1/sqrt(head_dim). The previous port scaled q by 1/head_dim and k by
+    // 1/sqrt(head_dim), which over-suppressed the dot product.
     float inv_scale = 1.0f / sqrtf((float)LINEAR_KEY_DIM);
 
     for (int h = 0; h < LINEAR_NUM_K_HEADS; h++) {
         float *qh = lin_q + h * LINEAR_KEY_DIM;
-        cpu_rms_norm_bare(qh, qh, LINEAR_KEY_DIM, 1e-6f);
-        float q_scale = inv_scale * inv_scale;  // inv_scale^2 = 1/head_k_dim
-        for (int d = 0; d < LINEAR_KEY_DIM; d++) qh[d] *= q_scale;
+        cpu_l2_norm_bare(qh, qh, LINEAR_KEY_DIM, 1e-6f);
+        for (int d = 0; d < LINEAR_KEY_DIM; d++) qh[d] *= inv_scale;
     }
     for (int h = 0; h < LINEAR_NUM_K_HEADS; h++) {
         float *kh = lin_k + h * LINEAR_KEY_DIM;
-        cpu_rms_norm_bare(kh, kh, LINEAR_KEY_DIM, 1e-6f);
-        for (int d = 0; d < LINEAR_KEY_DIM; d++) kh[d] *= inv_scale;
+        cpu_l2_norm_bare(kh, kh, LINEAR_KEY_DIM, 1e-6f);
     }
 
     // ---- Gated delta net recurrence ----
@@ -3906,10 +4174,50 @@ typedef struct {
     uint32_t *su_w;   uint16_t *su_s, *su_b;   // shared up_proj
     uint32_t *sd_w;   uint16_t *sd_s, *sd_b;   // shared down_proj
     uint32_t *seg_w;  uint16_t *seg_s, *seg_b; // shared_expert_gate
+    float *gate_w_f32;
+    float *sg_w_f32;
+    float *su_w_f32;
+    float *sd_w_f32;
+    float *seg_w_f32;
 } LayerWeightCache;
 
 static LayerWeightCache layer_cache[NUM_LAYERS];
 static int layer_cache_built = 0;
+
+static void cache_quant_or_bf16_matrix(
+    WeightFile *wf,
+    const char *weight_name,
+    const char *scales_name,
+    const char *biases_name,
+    uint32_t **w_q4,
+    uint16_t **s_q4,
+    uint16_t **b_q4,
+    float **w_f32
+) {
+    TensorInfo *w_info = get_tensor_info(wf, weight_name);
+    if (!w_info) {
+        fprintf(stderr, "WARNING: tensor '%s' not found\n", weight_name);
+        *w_q4 = NULL;
+        *s_q4 = NULL;
+        *b_q4 = NULL;
+        *w_f32 = NULL;
+        return;
+    }
+
+    void *w_ptr = (char *)wf->data + w_info->offset;
+    if (strcmp(w_info->dtype, "BF16") == 0) {
+        *w_f32 = materialize_bf16_matrix_f32((const uint16_t *)w_ptr, w_info);
+        *w_q4 = NULL;
+        *s_q4 = NULL;
+        *b_q4 = NULL;
+        return;
+    }
+
+    *w_f32 = NULL;
+    *w_q4 = (uint32_t *)w_ptr;
+    *s_q4 = get_tensor_ptr(wf, scales_name);
+    *b_q4 = get_tensor_ptr(wf, biases_name);
+}
 
 static void build_layer_cache(WeightFile *wf) {
     if (layer_cache_built) return;
@@ -3999,39 +4307,85 @@ static void build_layer_cache(WeightFile *wf) {
 
         // MoE weights (same for all layers)
         snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
-        lc->gate_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
-        lc->gate_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
-        lc->gate_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
-        lc->sg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
-        lc->sg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
-        lc->sg_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
-        lc->su_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
-        lc->su_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
-        lc->su_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
-        lc->sd_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
-        lc->sd_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
-        lc->sd_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
-        lc->seg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
-        lc->seg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
-        lc->seg_b = get_tensor_ptr(wf, name);
+        char gate_weight_name[256], gate_scales_name[256], gate_biases_name[256];
+        char sg_weight_name[256], sg_scales_name[256], sg_biases_name[256];
+        char su_weight_name[256], su_scales_name[256], su_biases_name[256];
+        char sd_weight_name[256], sd_scales_name[256], sd_biases_name[256];
+        char seg_weight_name[256], seg_scales_name[256], seg_biases_name[256];
+
+        snprintf(gate_weight_name, sizeof(gate_weight_name), "model.layers.%d.mlp.gate.weight", i);
+        snprintf(gate_scales_name, sizeof(gate_scales_name), "model.layers.%d.mlp.gate.scales", i);
+        snprintf(gate_biases_name, sizeof(gate_biases_name), "model.layers.%d.mlp.gate.biases", i);
+        cache_quant_or_bf16_matrix(wf, gate_weight_name, gate_scales_name, gate_biases_name,
+                                   &lc->gate_w, &lc->gate_s, &lc->gate_b, &lc->gate_w_f32);
+
+        snprintf(sg_weight_name, sizeof(sg_weight_name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
+        snprintf(sg_scales_name, sizeof(sg_scales_name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
+        snprintf(sg_biases_name, sizeof(sg_biases_name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
+        cache_quant_or_bf16_matrix(wf, sg_weight_name, sg_scales_name, sg_biases_name,
+                                   &lc->sg_w, &lc->sg_s, &lc->sg_b, &lc->sg_w_f32);
+
+        snprintf(su_weight_name, sizeof(su_weight_name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
+        snprintf(su_scales_name, sizeof(su_scales_name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
+        snprintf(su_biases_name, sizeof(su_biases_name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
+        cache_quant_or_bf16_matrix(wf, su_weight_name, su_scales_name, su_biases_name,
+                                   &lc->su_w, &lc->su_s, &lc->su_b, &lc->su_w_f32);
+
+        snprintf(sd_weight_name, sizeof(sd_weight_name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
+        snprintf(sd_scales_name, sizeof(sd_scales_name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
+        snprintf(sd_biases_name, sizeof(sd_biases_name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
+        cache_quant_or_bf16_matrix(wf, sd_weight_name, sd_scales_name, sd_biases_name,
+                                   &lc->sd_w, &lc->sd_s, &lc->sd_b, &lc->sd_w_f32);
+
+        snprintf(seg_weight_name, sizeof(seg_weight_name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
+        snprintf(seg_scales_name, sizeof(seg_scales_name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
+        snprintf(seg_biases_name, sizeof(seg_biases_name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
+        cache_quant_or_bf16_matrix(wf, seg_weight_name, seg_scales_name, seg_biases_name,
+                                   &lc->seg_w, &lc->seg_s, &lc->seg_b, &lc->seg_w_f32);
     }
 
     layer_cache_built = 1;
     printf("[cache] Pre-computed weight pointers for %d layers\n", runtime_num_layers());
+}
+
+static void compute_moe_gate_shared_cpu(
+    const LayerWeightCache *lc,
+    const float *h_post,
+    float *gate_scores,
+    float *shared_gate,
+    float *shared_up,
+    float *shared_gate_score,
+    int hidden_dim,
+    int num_experts,
+    int shared_intermediate
+) {
+    if (lc->gate_w_f32) {
+        cpu_f32_matvec(lc->gate_w_f32, h_post, gate_scores, num_experts, hidden_dim);
+    } else {
+        cpu_dequant_matvec(lc->gate_w, lc->gate_s, lc->gate_b, h_post, gate_scores,
+                           num_experts, hidden_dim, GROUP_SIZE);
+    }
+
+    if (lc->sg_w_f32) {
+        cpu_f32_matvec(lc->sg_w_f32, h_post, shared_gate, shared_intermediate, hidden_dim);
+    } else {
+        cpu_dequant_matvec(lc->sg_w, lc->sg_s, lc->sg_b, h_post, shared_gate,
+                           shared_intermediate, hidden_dim, GROUP_SIZE);
+    }
+
+    if (lc->su_w_f32) {
+        cpu_f32_matvec(lc->su_w_f32, h_post, shared_up, shared_intermediate, hidden_dim);
+    } else {
+        cpu_dequant_matvec(lc->su_w, lc->su_s, lc->su_b, h_post, shared_up,
+                           shared_intermediate, hidden_dim, GROUP_SIZE);
+    }
+
+    if (lc->seg_w_f32) {
+        cpu_f32_matvec(lc->seg_w_f32, h_post, shared_gate_score, 1, hidden_dim);
+    } else {
+        cpu_dequant_matvec(lc->seg_w, lc->seg_s, lc->seg_b, h_post, shared_gate_score,
+                           1, hidden_dim, GROUP_SIZE);
+    }
 }
 
 // ============================================================================
@@ -4051,6 +4405,8 @@ typedef struct {
     int valid[MAX_K];                   // which experts loaded successfully
     int actual_K;                       // number of experts
     float h_mid[HIDDEN_DIM];            // saved h_mid for final combine
+    float shared_out[HIDDEN_DIM];       // CPU-computed shared expert result (pre-gate when mixed precision)
+    int shared_out_valid;               // 1 if shared_out is already populated on CPU
     float shared_gate_score;            // saved shared expert gate score
     float *hidden;                      // pointer to hidden state (for writing final result)
     int layer_idx;                      // which layer produced this deferred state
@@ -4074,18 +4430,28 @@ static void finalize_deferred_experts(void) {
     int hidden_dim = runtime_hidden_size();
 
     if (g_deferred.gpu_combined) {
-        if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
-            runtime_dump_write_layer_f32(g_deferred.layer_idx, "shared_out_pre_gate",
-                                         (const float *)[g_metal->buf_shared_out contents],
-                                         hidden_dim);
-            runtime_dump_write_layer_scalar(g_deferred.layer_idx, "shared_gate_score",
-                                            g_deferred.shared_gate_score);
-        }
+        const float *shared_out_pre_gate = (const float *)[g_metal->buf_shared_out contents];
+        runtime_dump_write_layer_f32_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                           "shared_down_pre_gate", shared_out_pre_gate, hidden_dim);
+        runtime_dump_write_layer_scalar_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                              "shared_gate_score", g_deferred.shared_gate_score);
         // GPU-side combine: hidden state is already in buf_moe_hidden.
         // buf_input already has the normalized input for the next layer's CMD1.
         // Just read back hidden (needed for the residual connection in future layers).
         memcpy(g_deferred.hidden, [g_metal->buf_moe_hidden contents],
                hidden_dim * sizeof(float));
+        if (runtime_dump_stage_enabled(DUMP_STAGE_SHARED) &&
+            runtime_dump_layer_enabled(g_deferred.layer_idx)) {
+            float moe_sum_pre_residual[hidden_dim];
+            const float *hidden_out = (const float *)[g_metal->buf_moe_hidden contents];
+            for (int i = 0; i < hidden_dim; i++) {
+                moe_sum_pre_residual[i] = hidden_out[i] - g_deferred.h_mid[i];
+            }
+            runtime_dump_write_layer_f32_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                               "moe_sum_pre_residual", moe_sum_pre_residual, hidden_dim);
+        }
+        runtime_dump_write_layer_f32_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                           "layer_out", g_deferred.hidden, hidden_dim);
     } else {
         // CPU-side combine (original path)
         // Read back and accumulate routed expert outputs
@@ -4099,13 +4465,15 @@ static void finalize_deferred_experts(void) {
 
         // Read shared expert result
         float shared_out[hidden_dim];
-        memcpy(shared_out, [g_metal->buf_shared_out contents], hidden_dim * sizeof(float));
-        if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
-            runtime_dump_write_layer_f32(g_deferred.layer_idx, "shared_out_pre_gate",
-                                         shared_out, hidden_dim);
-            runtime_dump_write_layer_scalar(g_deferred.layer_idx, "shared_gate_score",
-                                            g_deferred.shared_gate_score);
+        if (g_deferred.shared_out_valid) {
+            memcpy(shared_out, g_deferred.shared_out, hidden_dim * sizeof(float));
+        } else {
+            memcpy(shared_out, [g_metal->buf_shared_out contents], hidden_dim * sizeof(float));
         }
+        runtime_dump_write_layer_f32_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                           "shared_down_pre_gate", shared_out, hidden_dim);
+        runtime_dump_write_layer_scalar_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                              "shared_gate_score", g_deferred.shared_gate_score);
 
         // Apply shared expert gate
         float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
@@ -4113,14 +4481,27 @@ static void finalize_deferred_experts(void) {
             shared_out[i] *= shared_weight;
         }
 
+        if (runtime_dump_stage_enabled(DUMP_STAGE_SHARED) &&
+            runtime_dump_layer_enabled(g_deferred.layer_idx)) {
+            float moe_sum_pre_residual[hidden_dim];
+            for (int i = 0; i < hidden_dim; i++) {
+                moe_sum_pre_residual[i] = moe_out[i] + shared_out[i];
+            }
+            runtime_dump_write_layer_f32_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                               "moe_sum_pre_residual", moe_sum_pre_residual, hidden_dim);
+        }
+
         // Final combine: hidden = h_mid + moe_out + shared_out
         for (int i = 0; i < hidden_dim; i++) {
             g_deferred.hidden[i] = g_deferred.h_mid[i] + moe_out[i] + shared_out[i];
         }
+        runtime_dump_write_layer_f32_stage(g_deferred.layer_idx, DUMP_STAGE_SHARED,
+                                           "layer_out", g_deferred.hidden, hidden_dim);
     }
 
     g_deferred.active = 0;
     g_deferred.gpu_combined = 0;
+    g_deferred.shared_out_valid = 0;
     g_deferred.cmd_experts = nil;
 }
 
@@ -4141,6 +4522,7 @@ static void discard_deferred_experts(void) {
     if (g_deferred.active) {
         g_deferred.active = 0;
         g_deferred.gpu_combined = 0;
+        g_deferred.shared_out_valid = 0;
         g_deferred.cmd_experts = nil;
     }
 }
@@ -4194,6 +4576,7 @@ static int s_spec_indices[MAX_K];         // speculative routing predicted exper
 static int s_spec_count = 0;              // number of speculative predictions this layer
 static float *s_shared_gate = NULL; // [SHARED_INTERMEDIATE]
 static float *s_shared_up  = NULL;  // [SHARED_INTERMEDIATE]
+static float *s_shared_act = NULL;  // [SHARED_INTERMEDIATE]
 static float *s_moe_out   = NULL;   // [HIDDEN_DIM]
 static float *s_shared_out = NULL;  // [HIDDEN_DIM]
 // Full attention scratch
@@ -4233,6 +4616,7 @@ static void init_layer_scratch(void) {
     s_spec_gate_scores = calloc(num_experts, sizeof(float));
     s_shared_gate = calloc(shared_intermediate, sizeof(float));
     s_shared_up  = calloc(shared_intermediate, sizeof(float));
+    s_shared_act = calloc(shared_intermediate, sizeof(float));
     s_moe_out    = calloc(hidden_dim, sizeof(float));
     s_shared_out = calloc(hidden_dim, sizeof(float));
     s_q_proj_out = calloc(q_proj_dim, sizeof(float));
@@ -4491,6 +4875,10 @@ static void fused_layer_forward(
         // No input_norm needed — CMD3 already computed it into buf_input.
         // normed is only needed if speculative routing is enabled (currently disabled).
         // Skip the readback to avoid unnecessary overhead.
+        if (runtime_dump_stage_enabled(DUMP_STAGE_ATTN) && runtime_dump_layer_enabled(layer_idx)) {
+            memcpy(normed, [g_metal->buf_input contents], hidden_dim * sizeof(float));
+            runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "attn_norm_in", normed, hidden_dim);
+        }
     } else {
         // ---- ORIGINAL PATH: CPU deferred completion + input norm ----
         // Complete deferred experts from previous layer
@@ -4507,6 +4895,7 @@ static void fused_layer_forward(
         cpu_vec_copy(residual, hidden, hidden_dim);
         cpu_rms_norm(hidden, lc->input_norm_w, normed, hidden_dim, RMS_NORM_EPS);
         if (g_timing_enabled) { t1 = now_ms(); g_timing.input_norm += t1 - t0; }
+        runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "attn_norm_in", normed, hidden_dim);
 
         // Submit CMD1: attention projections
         if (g_timing_enabled) { t0 = now_ms(); }
@@ -4625,6 +5014,10 @@ static void fused_layer_forward(
             }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+    }
+
+    if (runtime_dump_stage_enabled(DUMP_STAGE_ATTN) && runtime_dump_layer_enabled(layer_idx)) {
+        runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "layer_input", hidden, hidden_dim);
     }
 
     // =====================================================================
@@ -4746,6 +5139,9 @@ static void fused_layer_forward(
 
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
+    const float *attn_dump_cpu = NULL;
+    id<MTLBuffer> attn_dump_buf = nil;
+    int attn_dump_dim = 0;
 
     if (is_full) {
         // ---- Full attention CPU compute ----
@@ -4818,6 +5214,8 @@ static void fused_layer_forward(
             memcpy([g_metal->buf_attn_q contents], q, q_dim * sizeof(float));
             memcpy([g_metal->buf_attn_gate contents], q_gate, q_dim * sizeof(float));
             // attn_out_for_oproj will be set to NULL below — CMD2 reads buf_attn_out
+            attn_dump_buf = g_metal->buf_attn_out;
+            attn_dump_dim = q_dim;
         } else {
             // CPU fallback
             for (int h = 0; h < num_attn_heads; h++) {
@@ -4848,6 +5246,8 @@ static void fused_layer_forward(
             attn_out_for_oproj = NULL;  // signal CMD2 to use GPU buf_attn_out
         } else {
             attn_out_for_oproj = attn_out;
+            attn_dump_cpu = attn_out;
+            attn_dump_dim = q_dim;
         }
         // q_proj_out, k_out, v_out, q, q_gate, attn_out are static scratch.
     } else if (gpu_linear_attn) {
@@ -4856,6 +5256,8 @@ static void fused_layer_forward(
         // Set a non-NULL sentinel so CMD2 enters fused path, but skip the memcpy
         static float gpu_linear_sentinel;
         attn_out_for_oproj = &gpu_linear_sentinel;
+        attn_dump_buf = g_metal->batch_out[6];
+        attn_dump_dim = linear_total_value;
     } else {
         // ---- Linear attention CPU compute ----
         if (!linear_attn_bypass) {
@@ -4880,18 +5282,16 @@ static void fused_layer_forward(
             float *lin_k = conv_out + linear_total_key;
             float *lin_v = conv_out + 2 * linear_total_key;
 
-            // RMS normalize q and k
+            // RMS normalize q and k, then scale only q by 1/sqrt(head_dim)
             float inv_scale = 1.0f / sqrtf((float)linear_key_dim);
             for (int h = 0; h < linear_num_k_heads; h++) {
                 float *qh = lin_q + h * linear_key_dim;
-                cpu_rms_norm_bare(qh, qh, linear_key_dim, 1e-6f);
-                float q_scale = inv_scale * inv_scale;
-                for (int d = 0; d < linear_key_dim; d++) qh[d] *= q_scale;
+                cpu_l2_norm_bare(qh, qh, linear_key_dim, 1e-6f);
+                for (int d = 0; d < linear_key_dim; d++) qh[d] *= inv_scale;
             }
             for (int h = 0; h < linear_num_k_heads; h++) {
                 float *kh = lin_k + h * linear_key_dim;
-                cpu_rms_norm_bare(kh, kh, linear_key_dim, 1e-6f);
-                for (int d = 0; d < linear_key_dim; d++) kh[d] *= inv_scale;
+                cpu_l2_norm_bare(kh, kh, linear_key_dim, 1e-6f);
             }
 
             // Gated delta net recurrence
@@ -5004,6 +5404,8 @@ static void fused_layer_forward(
             }
 
             attn_out_for_oproj = gated_out;
+            attn_dump_cpu = gated_out;
+            attn_dump_dim = linear_total_value;
 
             // conv_out, out_values are static — no free needed
             // gated_out is static — freed/released after CMD2 submission below
@@ -5040,8 +5442,14 @@ static void fused_layer_forward(
     memset(shared_up, 0, shared_intermediate * sizeof(float));
     float shared_gate_score = 0.0f;
 
-    int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
-                            suw && sus && sub && seg_w && seg_s && seg_b);
+    int mixed_precision_moe = (lc->gate_w_f32 || lc->sg_w_f32 || lc->su_w_f32 ||
+                               lc->sd_w_f32 || lc->seg_w_f32);
+    int have_moe_gate_shared = ((lc->gate_w_f32 || (gate_w && gate_s && gate_b)) &&
+                                (lc->sg_w_f32   || (sgw && sgs && sgb)) &&
+                                (lc->su_w_f32   || (suw && sus && sub)) &&
+                                (lc->seg_w_f32  || (seg_w && seg_s && seg_b)));
+    int moe_gate_shared_q4_only = (!lc->gate_w_f32 && !lc->sg_w_f32 &&
+                                   !lc->su_w_f32 && !lc->seg_w_f32);
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
@@ -5050,7 +5458,7 @@ static void fused_layer_forward(
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
-        g_metal && g_metal->wf_buf && have_moe_weights &&
+        g_metal && g_metal->wf_buf && have_moe_gate_shared &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
         // ---- FULLY FUSED CMD2 ----
@@ -5233,15 +5641,16 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
-        BatchMatvecSpec moe_specs[4] = {
-            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)num_experts,         hidden_dim, GROUP_SIZE, 0 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 1 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 2 },
-            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                             hidden_dim, GROUP_SIZE, 3 },
-        };
-        // buf_input already contains h_post from Enc 4 output -- no memcpy needed
-        gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
+        BatchMatvecSpec moe_specs[4];
+        if (moe_gate_shared_q4_only) {
+            // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
+            moe_specs[0] = (BatchMatvecSpec){ gate_w, gate_s, gate_b, gate_scores, (uint32_t)num_experts, hidden_dim, GROUP_SIZE, 0 };
+            moe_specs[1] = (BatchMatvecSpec){ sgw,    sgs,    sgb,    shared_gate,  (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 1 };
+            moe_specs[2] = (BatchMatvecSpec){ suw,    sus,    sub,    shared_up,    (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 2 };
+            moe_specs[3] = (BatchMatvecSpec){ seg_w,  seg_s,  seg_b,  &shared_gate_score, 1, hidden_dim, GROUP_SIZE, 3 };
+            // buf_input already contains h_post from Enc 4 output -- no memcpy needed
+            gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
+        }
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
 
@@ -5250,12 +5659,15 @@ static void fused_layer_forward(
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
 
-        // Read back results
-        gpu_flush_batch_results(g_metal, moe_specs, 4);
-        // Read h_mid from GPU buffer (needed for final combine)
+        // Read back h_mid / h_post
         memcpy(h_mid, [g_metal->buf_h_mid contents], hidden_dim * sizeof(float));
-        // Read h_post from buf_input (needed for expert input)
         memcpy(h_post, [g_metal->buf_input contents], hidden_dim * sizeof(float));
+        if (moe_gate_shared_q4_only) {
+            gpu_flush_batch_results(g_metal, moe_specs, 4);
+        } else {
+            compute_moe_gate_shared_cpu(lc, h_post, gate_scores, shared_gate, shared_up,
+                                        &shared_gate_score, hidden_dim, num_experts, shared_intermediate);
+        }
         // Update hidden state to h_mid (= residual + o_proj)
         memcpy(hidden, h_mid, hidden_dim * sizeof(float));
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_wait += t1 - t0; }
@@ -5281,23 +5693,43 @@ static void fused_layer_forward(
         // Post-attention norm
         cpu_rms_norm(hidden, lc->post_attn_norm_w, h_post, hidden_dim, RMS_NORM_EPS);
 
-        // Routing + shared expert batch
-        if (have_moe_weights) {
-            BatchMatvecSpec moe_specs[4] = {
-                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)num_experts,         hidden_dim, GROUP_SIZE, 0 },
-                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 1 },
-                { suw,    sus,    sub,    shared_up,           (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 2 },
-                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                             hidden_dim, GROUP_SIZE, 3 },
-            };
-            fast_batch_matvec(h_post, hidden_dim, moe_specs, 4);
+        // Routing + shared expert projections
+        if (have_moe_gate_shared) {
+            if (moe_gate_shared_q4_only) {
+                BatchMatvecSpec moe_specs[4] = {
+                    { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)num_experts,         hidden_dim, GROUP_SIZE, 0 },
+                    { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 1 },
+                    { suw,    sus,    sub,    shared_up,           (uint32_t)shared_intermediate, hidden_dim, GROUP_SIZE, 2 },
+                    { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                             hidden_dim, GROUP_SIZE, 3 },
+                };
+                fast_batch_matvec(h_post, hidden_dim, moe_specs, 4);
+            } else {
+                compute_moe_gate_shared_cpu(lc, h_post, gate_scores, shared_gate, shared_up,
+                                            &shared_gate_score, hidden_dim, num_experts, shared_intermediate);
+            }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
     }
 
-    if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
-        runtime_dump_write_layer_f32(layer_idx, "h_post", h_post, hidden_dim);
-        runtime_dump_write_layer_f32(layer_idx, "router_logits", gate_scores, num_experts);
-        runtime_dump_write_layer_scalar(layer_idx, "shared_gate_score", shared_gate_score);
+    if (attn_dump_dim > 0) {
+        if (attn_dump_cpu) {
+            runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "attn_out",
+                                               attn_dump_cpu, attn_dump_dim);
+        } else if (attn_dump_buf) {
+            runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "attn_out",
+                                               (const float *)[attn_dump_buf contents], attn_dump_dim);
+        }
+    }
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "post_attn_residual", h_mid, hidden_dim);
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ATTN, "post_attn_norm", h_post, hidden_dim);
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_ROUTER, "router_logits", gate_scores, num_experts);
+    runtime_dump_write_layer_scalar_stage(layer_idx, DUMP_STAGE_SHARED, "shared_gate_score", shared_gate_score);
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED, "shared_gate", shared_gate, shared_intermediate);
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED, "shared_up", shared_up, shared_intermediate);
+    if (runtime_dump_stage_enabled(DUMP_STAGE_SHARED) && runtime_dump_layer_enabled(layer_idx)) {
+        cpu_swiglu(shared_gate, shared_up, s_shared_act, shared_intermediate);
+        runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED, "shared_swiglu",
+                                           s_shared_act, shared_intermediate);
     }
 
     // ---- Softmax + top-K (CPU) ----
@@ -5327,9 +5759,7 @@ static void fused_layer_forward(
         }
     }
 
-    if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
-        runtime_dump_write_layer_topk(layer_idx, expert_indices, expert_weights, K);
-    }
+    runtime_dump_write_layer_topk_stage(layer_idx, DUMP_STAGE_ROUTER, expert_indices, expert_weights, K);
 
     if (g_timing_enabled) { t1 = now_ms(); g_timing.routing_cpu += t1 - t0; }
 
@@ -5552,12 +5982,26 @@ static void fused_layer_forward(
             }
         }
 
+        if (mixed_precision_moe) {
+            cpu_swiglu(shared_gate, shared_up, s_shared_act, shared_intermediate);
+            runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED,
+                                               "shared_swiglu", s_shared_act, shared_intermediate);
+            if (lc->sd_w_f32) {
+                cpu_f32_matvec(lc->sd_w_f32, s_shared_act, shared_out, hidden_dim, shared_intermediate);
+            } else if (sdw && sds && sdb) {
+                cpu_dequant_matvec(sdw, sds, sdb, s_shared_act, shared_out,
+                                   hidden_dim, shared_intermediate, GROUP_SIZE);
+            }
+        }
+
         // Shared expert prep (doesn't need expert data — can overlap with async pread)
         memcpy([g_metal->buf_multi_expert_input contents], h_post, hidden_dim * sizeof(float));
-        memcpy([g_metal->buf_shared_gate contents], shared_gate,
-               shared_intermediate * sizeof(float));
-        memcpy([g_metal->buf_shared_up contents], shared_up,
-               shared_intermediate * sizeof(float));
+        if (!mixed_precision_moe) {
+            memcpy([g_metal->buf_shared_gate contents], shared_gate,
+                   shared_intermediate * sizeof(float));
+            memcpy([g_metal->buf_shared_up contents], shared_up,
+                   shared_intermediate * sizeof(float));
+        }
 
         // Wait for non-prediction async pread to complete
         if (!pred_started && g_async_pread.active) {
@@ -5590,30 +6034,32 @@ static void fused_layer_forward(
 
         gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
-        // Shared expert SwiGLU + down_proj (2 more encoders)
-        // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
+        if (!mixed_precision_moe) {
+            // Shared expert SwiGLU + down_proj (2 more encoders)
+            // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
 
-        // SwiGLU dispatch
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
-            [enc setComputePipelineState:g_metal->swiglu];
-            [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
-            [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
-            uint32_t dim = shared_intermediate;
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t swiglu_tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
+            // SwiGLU dispatch
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_experts computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->swiglu];
+                [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                uint32_t dim = shared_intermediate;
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t swiglu_tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
 
-        // Shared down_proj dispatch
-        if (sdw && sds && sdb) {
-            gpu_encode_dequant_matvec_with_io_bufs(
-                g_metal, cmd_experts, sdw, sds, sdb,
-                g_metal->buf_shared_act, g_metal->buf_shared_out,
-                hidden_dim, shared_intermediate, GROUP_SIZE);
+            // Shared down_proj dispatch
+            if (sdw && sds && sdb) {
+                gpu_encode_dequant_matvec_with_io_bufs(
+                    g_metal, cmd_experts, sdw, sds, sdb,
+                    g_metal->buf_shared_act, g_metal->buf_shared_out,
+                    hidden_dim, shared_intermediate, GROUP_SIZE);
+            }
         }
 
         // Step 4: GPU-side combine + residual + norm (if not last layer)
@@ -5628,7 +6074,8 @@ static void fused_layer_forward(
         // This makes CMD3 self-contained: it produces buf_input for the next layer's CMD1.
         // The next layer skips deferred_wait + finalize + input_norm entirely at layer start.
 
-        int gpu_combine = (g_metal->moe_combine_residual &&
+        int gpu_combine = (!mixed_precision_moe &&
+                           g_metal->moe_combine_residual &&
                            g_metal->rms_norm_sum &&
                            g_metal->rms_norm_apply_bf16 &&
                            g_metal->wf_buf &&
@@ -5722,11 +6169,12 @@ static void fused_layer_forward(
         g_deferred.cmd_experts = cmd_experts;
         g_deferred.actual_K = actual_K;
         g_deferred.shared_gate_score = shared_gate_score;
+        g_deferred.shared_out_valid = mixed_precision_moe ? 1 : 0;
         g_deferred.hidden = hidden;
         g_deferred.layer_idx = layer_idx;
-        if (!gpu_combine) {
-            // Only need to save h_mid for CPU-side combine path
-            memcpy(g_deferred.h_mid, h_mid, hidden_dim * sizeof(float));
+        memcpy(g_deferred.h_mid, h_mid, hidden_dim * sizeof(float));
+        if (mixed_precision_moe) {
+            memcpy(g_deferred.shared_out, shared_out, hidden_dim * sizeof(float));
         }
         for (int k = 0; k < actual_K; k++) {
             g_deferred.expert_weights[k] = expert_weights[k];
@@ -5787,38 +6235,60 @@ static void fused_layer_forward(
         free(expert_out_cpu);
 
         // CPU shared expert
-        float *shared_act = calloc(shared_intermediate, sizeof(float));
-        cpu_swiglu(shared_gate, shared_up, shared_act, shared_intermediate);
-        if (sdw && sds && sdb) {
-            cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                               hidden_dim, shared_intermediate, GROUP_SIZE);
+        if (!mixed_precision_moe) {
+            float *shared_act = calloc(shared_intermediate, sizeof(float));
+            cpu_swiglu(shared_gate, shared_up, shared_act, shared_intermediate);
+            runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED,
+                                               "shared_swiglu", shared_act, shared_intermediate);
+            if (lc->sd_w_f32) {
+                cpu_f32_matvec(lc->sd_w_f32, shared_act, shared_out, hidden_dim, shared_intermediate);
+            } else if (sdw && sds && sdb) {
+                cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+                                   hidden_dim, shared_intermediate, GROUP_SIZE);
+            }
+            free(shared_act);
         }
-        free(shared_act);
     } else {
         // No experts available -- still need shared expert
-        float *shared_act = calloc(shared_intermediate, sizeof(float));
-        cpu_swiglu(shared_gate, shared_up, shared_act, shared_intermediate);
-        if (sdw && sds && sdb) {
-            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                                hidden_dim, shared_intermediate, GROUP_SIZE);
+        if (!mixed_precision_moe) {
+            float *shared_act = calloc(shared_intermediate, sizeof(float));
+            cpu_swiglu(shared_gate, shared_up, shared_act, shared_intermediate);
+            runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED,
+                                               "shared_swiglu", shared_act, shared_intermediate);
+            if (lc->sd_w_f32) {
+                cpu_f32_matvec(lc->sd_w_f32, shared_act, shared_out, hidden_dim, shared_intermediate);
+            } else if (sdw && sds && sdb) {
+                fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
+                                    hidden_dim, shared_intermediate, GROUP_SIZE);
+            }
+            free(shared_act);
         }
-        free(shared_act);
     }
 
     // ---- Shared expert gate ----
-    if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
-        runtime_dump_write_layer_f32(layer_idx, "shared_out_pre_gate", shared_out, hidden_dim);
-        runtime_dump_write_layer_scalar(layer_idx, "shared_gate_score", shared_gate_score);
-    }
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED,
+                                       "shared_down_pre_gate", shared_out, hidden_dim);
+    runtime_dump_write_layer_scalar_stage(layer_idx, DUMP_STAGE_SHARED,
+                                          "shared_gate_score", shared_gate_score);
     float shared_weight = cpu_sigmoid(shared_gate_score);
     for (int i = 0; i < hidden_dim; i++) {
         shared_out[i] *= shared_weight;
+    }
+
+    if (runtime_dump_stage_enabled(DUMP_STAGE_SHARED) && runtime_dump_layer_enabled(layer_idx)) {
+        float moe_sum_pre_residual[hidden_dim];
+        for (int i = 0; i < hidden_dim; i++) {
+            moe_sum_pre_residual[i] = moe_out[i] + shared_out[i];
+        }
+        runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED,
+                                           "moe_sum_pre_residual", moe_sum_pre_residual, hidden_dim);
     }
 
     // ---- Final combine: hidden = h_mid + moe_out + shared_out ----
     for (int i = 0; i < hidden_dim; i++) {
         hidden[i] = h_mid[i] + moe_out[i] + shared_out[i];
     }
+    runtime_dump_write_layer_f32_stage(layer_idx, DUMP_STAGE_SHARED, "layer_out", hidden, hidden_dim);
 
     if (g_timing_enabled) {
         t1 = now_ms();
@@ -6133,14 +6603,19 @@ static const char *CORS_RESPONSE =
 
 // Tokenize a user turn (system prompt already cached in KV).
 // Only encodes: <|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
-static PromptTokens *tokenize_user_turn(const char *user_content) {
+static char *build_user_turn_text(const char *user_content) {
     const char *prefix = "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
-
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
     if (!prompt) return NULL;
     snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    return prompt;
+}
+
+static PromptTokens *tokenize_user_turn(const char *user_content) {
+    char *prompt = build_user_turn_text(user_content);
+    if (!prompt) return NULL;
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
@@ -6149,16 +6624,19 @@ static PromptTokens *tokenize_user_turn(const char *user_content) {
 // Tokenize a continuation turn for session caching.
 // Prefixes with <|im_end|>\n to close the previous assistant turn, then the new user turn.
 // Used when the KV cache already contains the prior conversation state.
-static PromptTokens *tokenize_continuation_turn(const char *user_content) {
-    // EOS/<|im_end|> is already in the state (fed through model at end of generation)
-    // Just need the newline + new user turn + assistant prompt
+static char *build_continuation_turn_text(const char *user_content) {
     const char *prefix = "\n<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
-
     size_t prompt_len = strlen(prefix) + strlen(user_content) + strlen(suffix) + 1;
     char *prompt = malloc(prompt_len);
     if (!prompt) return NULL;
     snprintf(prompt, prompt_len, "%s%s%s", prefix, user_content, suffix);
+    return prompt;
+}
+
+static PromptTokens *tokenize_continuation_turn(const char *user_content) {
+    char *prompt = build_continuation_turn_text(user_content);
+    if (!prompt) return NULL;
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
@@ -6183,22 +6661,28 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant. /think");
+    return strdup("You are a helpful assistant.");
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
+static char *build_chat_message_text(const char *system_prompt_text, const char *user_content) {
+    size_t sys_len = strlen(system_prompt_text);
+    size_t user_len = strlen(user_content);
+    size_t total = 30 + sys_len + 30 + user_len + 40;
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total,
+             "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+             system_prompt_text, user_content);
+    return prompt;
+}
+
 static PromptTokens *tokenize_chat_message(const char *user_content) {
     static char *sys_prompt_text = NULL;
     if (!sys_prompt_text) sys_prompt_text = load_system_prompt();
 
-    // Build: <|im_start|>system\n{sys_prompt}<|im_end|>\n<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n
-    size_t sys_len = strlen(sys_prompt_text);
-    size_t user_len = strlen(user_content);
-    size_t total = 30 + sys_len + 30 + user_len + 40;  // generous padding for tags
-    char *prompt = malloc(total);
+    char *prompt = build_chat_message_text(sys_prompt_text, user_content);
     if (!prompt) return NULL;
-    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-             sys_prompt_text, user_content);
     PromptTokens *pt = encode_prompt_text_to_tokens(prompt);
     free(prompt);
     return pt;
@@ -6208,7 +6692,7 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
 __attribute__((unused))
 static PromptTokens *tokenize_chat_message_old(const char *user_content) {
     const char *prefix =
-        "<|im_start|>system\nYou are a helpful assistant. /think<|im_end|>\n"
+        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
@@ -6504,9 +6988,15 @@ static void serve_loop(
             // New session: just the user turn (system prompt restored from snapshot)
             PromptTokens *pt;
             if (is_continuation) {
+                char *full_prompt_text = build_continuation_turn_text(content);
+                runtime_dump_write_prompt_context("continuation_turn", content, "", full_prompt_text);
                 pt = tokenize_continuation_turn(content);
+                free(full_prompt_text);
             } else {
+                char *full_prompt_text = build_user_turn_text(content);
+                runtime_dump_write_prompt_context("user_turn", content, "", full_prompt_text);
                 pt = tokenize_user_turn(content);
+                free(full_prompt_text);
             }
             if (!pt) {
                 http_write_str(client_fd,
@@ -6514,6 +7004,7 @@ static void serve_loop(
                     "{\"error\":\"tokenization failed\"}\n");
                 free(reqbuf); close(client_fd); continue;
             }
+            runtime_dump_write_prompt_tokens(pt);
 
             fprintf(stderr, "[serve] %s prompt=%d tokens%s\n", request_id, pt->count,
                     is_continuation ? " (continuation — skipping snapshot restore)" : "");
@@ -6784,6 +7275,8 @@ static void print_usage(const char *prog) {
     printf("  --manifest PATH      model_weights.json path\n");
     printf("  --vocab PATH         vocab.bin path\n");
     printf("  --dump-dir PATH      Dump comparison tensors for last prompt position\n");
+    printf("  --dump-layers SPEC   Dump only selected layers, e.g. 0,1,3,47 or 0-3\n");
+    printf("  --dump-stages LIST   Dump selected stages: embedding,attn,router,shared,final\n");
     printf("  --prompt-tokens PATH prompt_tokens.bin path\n");
     printf("  --prompt TEXT         Prompt text (uses tokenizer.bin)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
@@ -6804,6 +7297,8 @@ static void print_usage(const char *prog) {
 
 enum {
     OPT_DUMP_DIR = 1000,
+    OPT_DUMP_LAYERS,
+    OPT_DUMP_STAGES,
 };
 
 int main(int argc, char **argv) {
@@ -6827,6 +7322,8 @@ int main(int argc, char **argv) {
             {"manifest",      required_argument, 0, 'j'},
             {"vocab",         required_argument, 0, 'v'},
             {"dump-dir",      required_argument, 0, OPT_DUMP_DIR},
+            {"dump-layers",   required_argument, 0, OPT_DUMP_LAYERS},
+            {"dump-stages",   required_argument, 0, OPT_DUMP_STAGES},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
@@ -6855,6 +7352,8 @@ int main(int argc, char **argv) {
                 case 'j': manifest_path = optarg; break;
                 case 'v': vocab_path = optarg; break;
                 case OPT_DUMP_DIR: runtime_dump_enable(optarg); break;
+                case OPT_DUMP_LAYERS: runtime_dump_set_layers(optarg); break;
+                case OPT_DUMP_STAGES: runtime_dump_set_stages(optarg); break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
@@ -6987,21 +7486,37 @@ int main(int argc, char **argv) {
         init_runtime_special_tokens(vocab);
 
         // ---- Get prompt tokens (skip in serve mode) ----
+        // For CLI prompts, treat --prompt as a user message and wrap it in the
+        // Qwen chat template so standalone runs match the model's expected format.
         PromptTokens *pt = NULL;
         if (serve_port == 0) {
             if (prompt_text) {
-                pt = encode_prompt_text_to_tokens(prompt_text);
+                char *sys_prompt_text = load_system_prompt();
+                char *full_prompt_text = build_chat_message_text(sys_prompt_text, prompt_text);
+                runtime_dump_write_prompt_context("chat_message", prompt_text,
+                                                  sys_prompt_text, full_prompt_text);
+                pt = tokenize_chat_message(prompt_text);
+                free(full_prompt_text);
+                free(sys_prompt_text);
                 if (!pt) {
-                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
+                    fprintf(stderr, "ERROR: Failed to encode prompt text as a chat message.\n");
                     return 1;
                 }
             } else if (!prompt_tokens_path) {
-                pt = encode_prompt_text_to_tokens("Hello, what is");
+                const char *default_user_text = "Hello, what is";
+                char *sys_prompt_text = load_system_prompt();
+                char *full_prompt_text = build_chat_message_text(sys_prompt_text, default_user_text);
+                runtime_dump_write_prompt_context("chat_message", default_user_text,
+                                                  sys_prompt_text, full_prompt_text);
+                pt = tokenize_chat_message(default_user_text);
+                free(full_prompt_text);
+                free(sys_prompt_text);
                 if (!pt) {
-                    fprintf(stderr, "ERROR: No prompt tokens and encode_prompt.py not found\n");
+                    fprintf(stderr, "ERROR: Failed to build default chat prompt\n");
                     return 1;
                 }
             } else {
+                runtime_dump_write_prompt_context("prompt_tokens_bin", "", "", "");
                 pt = load_prompt_tokens(prompt_tokens_path);
             }
 
@@ -7229,7 +7744,7 @@ int main(int argc, char **argv) {
             } else {
                 embed_lookup(wf, pt->ids[0], hidden);
             }
-            runtime_dump_write_f32_named("embedding", hidden, runtime_hidden_size());
+            runtime_dump_write_f32_stage(DUMP_STAGE_EMBEDDING, "embedding", hidden, runtime_hidden_size());
 
             for (int layer = 0; layer < runtime_num_layers(); layer++) {
                 int is_full = runtime_layer_is_full(layer);
@@ -7259,8 +7774,8 @@ int main(int argc, char **argv) {
         double t_lm = now_ms();
         lm_head_forward(wf, hidden, logits);
         double lm_ms = now_ms() - t_lm;
-        runtime_dump_write_f32_named("final_hidden", hidden, runtime_hidden_size());
-        runtime_dump_write_f32_named("logits", logits, runtime_vocab_size());
+        runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "final_hidden", hidden, runtime_hidden_size());
+        runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "logits", logits, runtime_vocab_size());
 
         // ---- Sample first token ----
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
@@ -7318,7 +7833,9 @@ int main(int argc, char **argv) {
 
             // Embed the just-generated token (next iteration)
             cache_telemetry_note_token();
+            runtime_dump_begin_step("gen", pos, next_token);
             embed_lookup(wf, next_token, hidden);
+            runtime_dump_write_f32_stage(DUMP_STAGE_EMBEDDING, "embedding", hidden, runtime_hidden_size());
 
             for (int layer = 0; layer < runtime_num_layers(); layer++) {
                 int is_full = runtime_layer_is_full(layer);
@@ -7343,9 +7860,12 @@ int main(int argc, char **argv) {
 
             // LM head
             lm_head_forward(wf, hidden, logits);
+            runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "final_hidden", hidden, runtime_hidden_size());
+            runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "logits", logits, runtime_vocab_size());
 
             // Greedy sample
             next_token = cpu_argmax(logits, VOCAB_SIZE);
+            runtime_dump_finish_step(next_token);
 
             // Think budget: force end thinking if over budget
             if (in_think && g_think_budget > 0 && think_tokens >= g_think_budget) {

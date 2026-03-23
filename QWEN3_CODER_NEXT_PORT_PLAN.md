@@ -517,3 +517,110 @@ How to test this milestone:
    ```bash
    python3 tools/reference_compare.py --model "$QWEN3_CODER_NEXT_MODEL_PATH" --dump-dir /tmp/qwen3-next-dump --layers 0,1,47
    ```
+
+### Step 10: Fix tokenizer/vocab decode table for added tokens
+What changed:
+- Fixed [metal_infer/export_tokenizer.py](/Users/sk/dev/flash-moe/metal_infer/export_tokenizer.py) so `vocab.bin` now includes the full contiguous decode table:
+  - base tokenizer vocab entries
+  - added special tokens such as `<|im_end|>`, `<|endoftext|>`, `<think>`, and `</think>`
+- Added validation in the exporter to reject conflicting base-vocab vs added-token ids.
+- Hardened [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m) vocabulary loading:
+  - it now respects the full decode-table `max_id`
+  - it prints the loaded decode range explicitly
+  - it warns if configured special token ids still exceed the loaded decode table
+
+Why this changed:
+- Real Qwen3-Coder-Next runs showed `vocab.bin` only contained `151643` base vocab entries while the tokenizer's special tokens live at ids `151643..151668`.
+- That meant runtime decoding and special-token handling could be wrong even when the model forward pass itself was otherwise functioning.
+
+What still blocks correctness:
+- The runtime can now load the full decode table, but generation quality is still not yet acceptable.
+- Early-layer routing/shared-expert drift remains visible in [tools/reference_compare.py](/Users/sk/dev/flash-moe/tools/reference_compare.py) output and still needs investigation in the fused runtime path.
+- The custom BPE tokenizer still has not been compared side-by-side against Hugging Face tokenization for representative prompts.
+
+How to test this milestone:
+1. Re-export tokenizer assets:
+   ```bash
+   python3 metal_infer/export_tokenizer.py --model-dir "$QWEN3_CODER_NEXT_MODEL_PATH"
+   ```
+2. Confirm `vocab.bin` now exposes the full decode range:
+   ```bash
+   python3 - <<'PY'
+   import os, struct
+   path = os.path.join(os.environ["QWEN3_CODER_NEXT_MODEL_PATH"], "vocab.bin")
+   with open(path, "rb") as f:
+       print(struct.unpack("<II", f.read(8)))
+   PY
+   ```
+   Expected: `(151669, 151668)`
+3. Rebuild and rerun `infer`, then confirm startup reports the full decode table and no longer uses out-of-range special token ids.
+
+### Step 11: Add targeted dump filters, operator-local parity checks, and canned validation
+What changed:
+- Expanded [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m) runtime dumps:
+  - new flags: `--dump-layers SPEC` and `--dump-stages LIST`
+  - writes prompt context metadata for tokenizer-parity checks
+  - can dump selected checkpoints for selected layers only
+  - added checkpoints around:
+    - layer input and attention input norm
+    - post-attention residual and post-attention norm
+    - shared gate / up / SwiGLU / down-proj path
+    - MoE sum before residual
+    - layer output after residual
+- Reworked [tools/reference_compare.py](/Users/sk/dev/flash-moe/tools/reference_compare.py):
+  - threshold profile support via `--fail-threshold-profile`
+  - per-layer first-failure reporting
+  - nonzero exit on the earliest failed checkpoint
+  - tokenizer prompt/decode parity checks when `prompt_context.json` is available
+  - compares:
+    - embedding
+    - attention input norm
+    - post-attention residual and norm
+    - router logits + exact top-k
+    - shared expert gate / up / SwiGLU / down path
+    - routed MoE sum and final layer output
+    - final logits
+- Added [tools/validate_qwen3_next_runtime.py](/Users/sk/dev/flash-moe/tools/validate_qwen3_next_runtime.py):
+  - canned plain-text, tool-envelope, and JSON validation prompts
+  - runs the compare harness on the first pass of each prompt
+
+Why this changed:
+- The earlier comparison flow was enough to prove that the runtime was alive, but not enough to isolate the first bad operator.
+- The remaining correctness gap is now in early-layer math and tool/chat behavior, so the debugging flow needs narrower checkpoints and regression gating.
+
+What still blocks correctness:
+- The compare harness is still operator-local around the attention output itself; it does not yet reconstruct the full reference attention output for each dumped token position.
+- Real on-device validation still has to happen on Apple Silicon with Metal enabled.
+- Output quality and tool-calling parity are still not proven until the new validation suite passes on the converted model.
+
+How to test this milestone:
+1. Rebuild and inspect the new CLI:
+   ```bash
+   cd metal_infer
+   make infer
+   ./infer --help
+   ```
+2. Generate a filtered dump:
+   ```bash
+   ./infer \
+     --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+     --prompt "Hello" \
+     --tokens 1 \
+     --k 10 \
+     --dump-dir /tmp/qwen3-next-dump \
+     --dump-layers 0,1,47 \
+     --dump-stages embedding,attn,router,shared,final
+   ```
+3. Run the first-failure oracle:
+   ```bash
+   python3 tools/reference_compare.py \
+     --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+     --dump-dir /tmp/qwen3-next-dump \
+     --layers 0,1,47
+   ```
+4. Run the canned runtime suite:
+   ```bash
+   python3 tools/validate_qwen3_next_runtime.py \
+     --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+     --output /tmp/qwen3-next-validation.json
+   ```
