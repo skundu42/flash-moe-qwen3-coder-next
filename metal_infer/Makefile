@@ -7,8 +7,8 @@
 #   make bench    — benchmark single expert (10 iterations)
 #   make moe      — full MoE forward pass (K experts, single layer)
 #   make moebench — benchmark MoE (10 iterations)
-#   make full     — full 60-layer MoE forward pass (K=4)
-#   make fullbench — benchmark full 60-layer forward (3 iterations)
+#   make full     — full Qwen3-Coder-Next MoE forward pass (K=10)
+#   make fullbench — benchmark full Qwen3-Coder-Next forward (3 iterations)
 #   make chat     — build interactive chat TUI
 #   make clean    — remove build artifacts
 #
@@ -86,18 +86,18 @@ moebench: $(TARGET)
 	./$(TARGET) --layer 0 --fast --moe --benchmark
 
 full: $(TARGET)
-	./$(TARGET) --fast --full --k 4
+	./$(TARGET) --fast --full --k 10
 
 fullbench: $(TARGET)
-	./$(TARGET) --fast --full --k 4 --benchmark
+	./$(TARGET) --fast --full --k 10 --benchmark
 
 # Inference engine targets
 build-infer: $(INFER_TARGET)
 
 infer-run: $(INFER_TARGET)
-	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 4
+	./$(INFER_TARGET) --prompt "Hello, what is" --tokens 20 --k 10
 
 # Chat TUI targets (use: make chat)
 
 chat-run: $(CHAT_TARGET)
-	./$(CHAT_TARGET) --k 4
+	./$(CHAT_TARGET) --k 10

@@ -1,27 +1,27 @@
 /*
- * main.m — Pure C/Metal 4-bit dequantized MoE expert computation engine
+ * main.m — Pure C/Metal 4-bit dequantized Qwen3-Coder-Next MoE expert engine
  *
  * Standalone benchmark of 4-bit dequant matvec via Metal compute shaders.
  * Loads expert weights from packed binary files, runs the Metal shader, verifies output.
  *
- * Supports single-layer mode (original) and full 60-layer forward pass (--full).
+ * Supports single-layer mode (original) and full 48-layer forward pass (--full).
  *
- * This is the foundation for a full llama.cpp-style inference engine for
- * Qwen3.5-397B-A17B running on Apple Silicon with SSD-streamed expert weights.
+ * This is the foundation for a full Qwen3-Coder-Next inference engine
+ * running on Apple Silicon with SSD-streamed expert weights.
  *
  * Build: make
  * Run:   ./metal_infer [--layer N] [--expert E] [--benchmark]
- *        ./metal_infer --model <path> --full --k 4 --benchmark
+ *        ./metal_infer --model <path> --full --k 10 --benchmark
  *
  * What it does:
  *   1. Creates Metal device, command queue, loads compute shaders
- *   2. Opens packed expert files (one per layer, or all 60 for --full)
+ *   2. Opens packed expert files (one per layer, or all 48 for --full)
  *   3. pread()s expert weights into Metal shared buffers (8 pthreads parallel I/O)
  *   4. Runs the full MoE expert forward pass per layer:
- *      - gate_proj matvec (4096 -> 1024)
- *      - up_proj matvec (4096 -> 1024)
+ *      - gate_proj matvec (2048 -> 512)
+ *      - up_proj matvec (2048 -> 512)
  *      - SwiGLU activation
- *      - down_proj matvec (1024 -> 4096)
+ *      - down_proj matvec (512 -> 2048)
  *      - weighted_sum to combine K experts
  *   5. In --full mode: pipelines I/O with compute via double buffering
  *   6. Reports timing and throughput
@@ -42,43 +42,43 @@
 #include <errno.h>
 
 // ============================================================================
-// Constants matching the Qwen3.5-397B packed expert layout
+// Constants matching the Qwen3-Coder-Next packed expert layout
 // ============================================================================
 
-#define HIDDEN_DIM       4096
-#define INTERMEDIATE_DIM 1024
+#define HIDDEN_DIM       2048
+#define INTERMEDIATE_DIM 512
 #define GROUP_SIZE       64
 #define BITS             4
 #define NUM_EXPERTS      512
-#define NUM_LAYERS       60
+#define NUM_LAYERS       48
 #define MAX_ACTIVE_EXPERTS 64
 
 // Expert component sizes (from layout.json)
 #define GATE_W_OFFSET    0
-#define GATE_W_SIZE      2097152   // [1024, 512] uint32
-#define GATE_S_OFFSET    2097152
-#define GATE_S_SIZE      131072    // [1024, 64] uint16 (bf16)
-#define GATE_B_OFFSET    2228224
-#define GATE_B_SIZE      131072
+#define GATE_W_SIZE      524288
+#define GATE_S_OFFSET    524288
+#define GATE_S_SIZE      32768
+#define GATE_B_OFFSET    557056
+#define GATE_B_SIZE      32768
 
-#define UP_W_OFFSET      2359296
-#define UP_W_SIZE        2097152
-#define UP_S_OFFSET      4456448
-#define UP_S_SIZE        131072
-#define UP_B_OFFSET      4587520
-#define UP_B_SIZE        131072
+#define UP_W_OFFSET      589824
+#define UP_W_SIZE        524288
+#define UP_S_OFFSET      1114112
+#define UP_S_SIZE        32768
+#define UP_B_OFFSET      1146880
+#define UP_B_SIZE        32768
 
-#define DOWN_W_OFFSET    4718592
-#define DOWN_W_SIZE      2097152   // [4096, 128] uint32
-#define DOWN_S_OFFSET    6815744
-#define DOWN_S_SIZE      131072    // [4096, 16] uint16 (bf16)
-#define DOWN_B_OFFSET    6946816
-#define DOWN_B_SIZE      131072
+#define DOWN_W_OFFSET    1179648
+#define DOWN_W_SIZE      524288
+#define DOWN_S_OFFSET    1703936
+#define DOWN_S_SIZE      32768
+#define DOWN_B_OFFSET    1736704
+#define DOWN_B_SIZE      32768
 
-#define EXPERT_SIZE      7077888   // Total bytes per expert
+#define EXPERT_SIZE      1769472
 
 // Default model path
-#define MODEL_PATH "/Users/danielwoods/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+#define MODEL_PATH "./Qwen3-Coder-Next"
 
 // ============================================================================
 // Timing helper
@@ -519,18 +519,18 @@ static ExpertTiming run_expert_forward(
     // Create a single command buffer for the full expert pipeline
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
-    // gate_proj: [4096] -> [1024]
+    // gate_proj: [2048] -> [512]
     metal_dequant_matvec(ctx, cmdbuf, gate_w, gate_s, gate_b, x_buf, gate_out,
                          inter, hidden, gs, use_fast);
 
-    // up_proj: [4096] -> [1024]
+    // up_proj: [2048] -> [512]
     metal_dequant_matvec(ctx, cmdbuf, up_w, up_s, up_b, x_buf, up_out,
                          inter, hidden, gs, use_fast);
 
     // SwiGLU: silu(gate) * up -> [1024]
     metal_swiglu(ctx, cmdbuf, gate_out, up_out, act_out, inter);
 
-    // down_proj: [1024] -> [4096]
+    // down_proj: [512] -> [2048]
     metal_dequant_matvec(ctx, cmdbuf, down_w, down_s, down_b, act_out, out_buf,
                          hidden, inter, gs, use_fast);
 
@@ -591,7 +591,7 @@ static ExpertTiming run_expert_forward_fast(
     double t_compute_start = now_ms();
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
 
-    // gate_proj: [4096] -> [1024]
+    // gate_proj: [2048] -> [512]
     metal_dequant_matvec_offset(ctx, cmdbuf,
         expert_buf, GATE_W_OFFSET,
         expert_buf, GATE_S_OFFSET,
@@ -600,7 +600,7 @@ static ExpertTiming run_expert_forward_fast(
         gate_out, 0,
         inter, hidden, gs, use_fast);
 
-    // up_proj: [4096] -> [1024]
+    // up_proj: [2048] -> [512]
     metal_dequant_matvec_offset(ctx, cmdbuf,
         expert_buf, UP_W_OFFSET,
         expert_buf, UP_S_OFFSET,
@@ -612,7 +612,7 @@ static ExpertTiming run_expert_forward_fast(
     // SwiGLU
     metal_swiglu(ctx, cmdbuf, gate_out, up_out, act_out, inter);
 
-    // down_proj: [1024] -> [4096]
+    // down_proj: [512] -> [2048]
     metal_dequant_matvec_offset(ctx, cmdbuf,
         expert_buf, DOWN_W_OFFSET,
         expert_buf, DOWN_S_OFFSET,
@@ -1056,7 +1056,7 @@ static void encode_expert_compute(
     uint32_t inter  = INTERMEDIATE_DIM;
     uint32_t gs     = GROUP_SIZE;
 
-    // gate_proj: [4096] -> [1024]
+    // gate_proj: [2048] -> [512]
     metal_dequant_matvec_offset(ctx, cmdbuf,
         expert_buf, GATE_W_OFFSET,
         expert_buf, GATE_S_OFFSET,
@@ -1064,7 +1064,7 @@ static void encode_expert_compute(
         x_buf, 0, gate_out, 0,
         inter, hidden, gs, use_fast);
 
-    // up_proj: [4096] -> [1024]
+    // up_proj: [2048] -> [512]
     metal_dequant_matvec_offset(ctx, cmdbuf,
         expert_buf, UP_W_OFFSET,
         expert_buf, UP_S_OFFSET,
@@ -1075,7 +1075,7 @@ static void encode_expert_compute(
     // SwiGLU
     metal_swiglu(ctx, cmdbuf, gate_out, up_out, act_out, inter);
 
-    // down_proj: [1024] -> [4096]
+    // down_proj: [512] -> [2048]
     metal_dequant_matvec_offset(ctx, cmdbuf,
         expert_buf, DOWN_W_OFFSET,
         expert_buf, DOWN_S_OFFSET,
@@ -1113,11 +1113,11 @@ static void encode_weighted_sum(
 }
 
 // ============================================================================
-// Full 60-layer MoE forward pass with double-buffered I/O + compute pipeline
+// Full 48-layer MoE forward pass with double-buffered I/O + compute pipeline
 // ============================================================================
 //
 // Architecture:
-//   - Opens all 60 layer files at startup
+//   - Opens all 48 layer files at startup
 //   - For each layer: picks K experts, preads them in parallel, runs GPU compute
 //   - Double buffering: while GPU computes layer N, pread layer N+1 into buffer set B
 //   - Single command buffer per layer (all K expert computes + weighted sum)
@@ -1457,12 +1457,12 @@ static void cpu_expert_forward(
     pread(packed_fd, down_s, DOWN_S_SIZE, expert_offset + DOWN_S_OFFSET);
     pread(packed_fd, down_b, DOWN_B_SIZE, expert_offset + DOWN_B_OFFSET);
 
-    // gate_proj: [4096] -> [1024]
+    // gate_proj: [2048] -> [512]
     float gate_out[INTERMEDIATE_DIM];
     cpu_dequant_matvec_4bit(gate_w, gate_s, gate_b, x, gate_out,
                             INTERMEDIATE_DIM, HIDDEN_DIM, GROUP_SIZE);
 
-    // up_proj: [4096] -> [1024]
+    // up_proj: [2048] -> [512]
     float up_out[INTERMEDIATE_DIM];
     cpu_dequant_matvec_4bit(up_w, up_s, up_b, x, up_out,
                             INTERMEDIATE_DIM, HIDDEN_DIM, GROUP_SIZE);
@@ -1471,7 +1471,7 @@ static void cpu_expert_forward(
     float act_out[INTERMEDIATE_DIM];
     cpu_swiglu(gate_out, up_out, act_out, INTERMEDIATE_DIM);
 
-    // down_proj: [1024] -> [4096]
+    // down_proj: [512] -> [2048]
     cpu_dequant_matvec_4bit(down_w, down_s, down_b, act_out, out,
                             HIDDEN_DIM, INTERMEDIATE_DIM, GROUP_SIZE);
 }
@@ -1486,8 +1486,8 @@ static void print_usage(const char *prog) {
     printf("  --expert E       Expert index (default: 0)\n");
     printf("  --benchmark      Run timing benchmark (10 iterations)\n");
     printf("  --moe            Run full MoE with K experts on one layer\n");
-    printf("  --full           Run full 60-layer MoE forward pass\n");
-    printf("  --k N            Number of active experts per layer (default: 4)\n");
+    printf("  --full           Run full 48-layer MoE forward pass\n");
+    printf("  --k N            Number of active experts per layer (default: 10)\n");
     printf("  --verify         Verify Metal output against CPU reference\n");
     printf("  --fast           Use threadgroup-optimized shader\n");
     printf("  --model PATH     Model path (default: built-in)\n");
@@ -1501,10 +1501,11 @@ int main(int argc, char **argv) {
         int do_benchmark = 0;
         int do_moe = 0;
         int do_full = 0;
-        int num_active_experts = 4;  // --k flag
+        int num_active_experts = 10;  // --k flag
         int do_verify = 0;
         int use_fast = 0;
-        const char *model_path = MODEL_PATH;
+        const char *model_path = getenv("QWEN3_CODER_NEXT_MODEL_PATH");
+        if (!model_path || !model_path[0]) model_path = MODEL_PATH;
 
         static struct option long_options[] = {
             {"layer",     required_argument, 0, 'l'},
@@ -1551,7 +1552,7 @@ int main(int argc, char **argv) {
 
         printf("=== metal_infer: 4-bit dequant MoE engine (v3 optimized) ===\n");
         if (do_full) {
-            printf("Mode: FULL 60-layer forward, K=%d, Shader: %s, Benchmark: %s\n",
+            printf("Mode: FULL 48-layer forward, K=%d, Shader: %s, Benchmark: %s\n",
                    num_active_experts, shader_name,
                    do_benchmark ? "YES" : "NO");
         } else {
@@ -1566,9 +1567,9 @@ int main(int argc, char **argv) {
         MetalContext *ctx = metal_init();
         if (!ctx) return 1;
 
-        // ========== Full 60-layer forward pass mode ==========
+        // ========== Full 48-layer forward pass mode ==========
         if (do_full) {
-            // ---- Open ALL 60 packed layer files ----
+            // ---- Open all 48 packed layer files ----
             int layer_fds[NUM_LAYERS];
             int open_count = 0;
             printf("\n[io] Opening all %d layer files...\n", NUM_LAYERS);

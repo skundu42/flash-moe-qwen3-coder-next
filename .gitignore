@@ -12,6 +12,15 @@ metal_infer/model_weights.bin
 metal_infer/model_weights.json
 metal_infer/vocab.bin
 metal_infer/tokenizer.bin
+model_weights.bin
+model_weights.json
+vocab.bin
+tokenizer.bin
+prompt_tokens.bin
+packed_experts/
+packed_experts_q4/
+packed_experts_2bit/
+Qwen3-Coder-Next/
 
 # Python
 __pycache__/
@@ -30,6 +39,7 @@ __pycache__/
 *.npz
 logs/
 *.log
+artifacts/
 
 # Test binaries and experiment data
 metal_infer/test_lzfse

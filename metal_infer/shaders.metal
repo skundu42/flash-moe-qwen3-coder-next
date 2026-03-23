@@ -16,13 +16,13 @@
  *   - Dequantized value = uint4_val * scale + bias
  *   - Groups of 64 elements share one (scale, bias) pair
  *
- * Matrix layout for expert projections:
- *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
- *   down_proj: [4096, 128] uint32 = [4096, 1024] logical (out=4096, in=1024)
+ * Matrix layout for Qwen3-Coder-Next expert projections:
+ *   gate_proj/up_proj: [512, 256] uint32 = [512, 2048] logical (out=512, in=2048)
+ *   down_proj: [2048, 64] uint32 = [2048, 512] logical (out=2048, in=512)
  *
  *   Scales/biases: [out_dim, in_dim/group_size]
- *   gate/up scales: [1024, 64]   (4096/64 = 64 groups)
- *   down scales:    [4096, 16]   (1024/64 = 16 groups)
+ *   gate/up scales: [512, 32]    (2048/64 = 32 groups)
+ *   down scales:    [2048, 8]    (512/64 = 8 groups)
  */
 
 #include <metal_stdlib>
@@ -1253,7 +1253,7 @@ kernel void gated_rms_norm(
 //   hidden[i] = h_mid[i] + sum_k(expert_weight[k] * expert_out[k][i])
 //               + sigmoid(shared_gate_score) * shared_out[i]
 //
-// All 8 expert output buffers are always bound (unused ones have weight=0).
+// All expert output buffers are always bound (unused ones have weight=0).
 // This avoids variable buffer bindings and keeps the dispatch simple.
 //
 // Dispatch: (dim + 255) / 256 threadgroups, 256 threads each.
@@ -1270,19 +1270,21 @@ kernel void moe_combine_residual(
     device const float* expert_out5 [[buffer(8)]],   // [dim] expert 5
     device const float* expert_out6 [[buffer(9)]],   // [dim] expert 6
     device const float* expert_out7 [[buffer(10)]],  // [dim] expert 7
-    device const float* params      [[buffer(11)]],  // [10]: weights[0..7], shared_gate_score, (unused)
-    constant uint&      dim         [[buffer(12)]],
-    constant uint&      K           [[buffer(13)]],
+    device const float* expert_out8 [[buffer(11)]],  // [dim] expert 8
+    device const float* expert_out9 [[buffer(12)]],  // [dim] expert 9
+    device const float* params      [[buffer(13)]],  // [12]: weights[0..9], shared_gate_score, (unused)
+    constant uint&      dim         [[buffer(14)]],
+    constant uint&      K           [[buffer(15)]],
     uint tid [[thread_position_in_grid]]
 ) {
     if (tid >= dim) return;
 
     // Read expert weights and shared gate from params buffer
-    float shared_gate = 1.0f / (1.0f + exp(-params[8]));  // sigmoid(shared_gate_score)
+    float shared_gate = 1.0f / (1.0f + exp(-params[10]));  // sigmoid(shared_gate_score)
 
     // Weighted sum of expert outputs
     float moe = 0.0f;
-    // Unrolled for MAX_K=8 with branch on K to avoid reading invalid buffers
+    // Unrolled for MAX_K=10 with branch on K to avoid reading invalid buffers.
     if (K > 0) moe += params[0] * expert_out0[tid];
     if (K > 1) moe += params[1] * expert_out1[tid];
     if (K > 2) moe += params[2] * expert_out2[tid];
@@ -1291,6 +1293,8 @@ kernel void moe_combine_residual(
     if (K > 5) moe += params[5] * expert_out5[tid];
     if (K > 6) moe += params[6] * expert_out6[tid];
     if (K > 7) moe += params[7] * expert_out7[tid];
+    if (K > 8) moe += params[8] * expert_out8[tid];
+    if (K > 9) moe += params[9] * expert_out9[tid];
 
     hidden_out[tid] = h_mid[tid] + moe + shared_gate * shared_out[tid];
 }
