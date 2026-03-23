@@ -133,7 +133,7 @@ RUN_QWEN3_CODER_NEXT.md
 ## Runtime Notes
 
 - The runtime is currently Qwen3-Coder-Next-focused.
-- `--2bit` is not supported for this port.
+- The runtime is 4-bit-expert-only for this port.
 - The runtime expects packed experts under:
   - `$QWEN3_CODER_NEXT_MODEL_PATH/packed_experts/`
 - The runtime now looks in the selected model directory first for:

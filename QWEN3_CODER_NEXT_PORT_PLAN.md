@@ -65,8 +65,6 @@ Sources:
     - 512 experts/layer
     - fixed component set and byte sizes
     - expert tensors stored aggregated per layer in safetensors
-- `metal_infer/repack_experts_2bit.py`
-  - Assumes the existing 4-bit packed expert layout and specific shapes when requantizing to 2-bit.
 - `metal_infer/export_tokenizer.py`
   - Hardcodes the old model path and assumes the tokenizer export source already exists locally.
 - `metal_infer/chat.m`
@@ -291,7 +289,7 @@ What still blocks correctness:
 - [metal_infer/main.m](/Users/sk/dev/flash-moe/metal_infer/main.m) still assumes the old expert blob layout and old dimensions.
 - Special token ids and prompt-format assumptions are still tied to the old model family.
 - No end-to-end Qwen3-Coder-Next generation run has been executed in this workspace because the local weights are not available here.
-- The runtime still only has a legacy 2-bit path; qwen3-next support is currently targeting the 4-bit expert runtime.
+- The runtime still needed the dead 2-bit path deleted so the qwen3-next port had one consistent expert format.
 
 How to test this milestone:
 1. Rebuild the runtime:
@@ -353,13 +351,43 @@ What still blocks correctness:
 - Some fallback/helper paths in [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m) still contain old hardcoded dimensions outside the main fused path.
 - Special token ids are still hardcoded in the runtime and should ideally be exported from tokenizer/model metadata instead of remaining literals.
 - No end-to-end converted local Qwen3-Coder-Next run has been executed yet.
-- The 2-bit path remains old-model-specific and should be treated as unsupported for the qwen-next port.
+- The runtime still needed the dead 2-bit path removed entirely so the Qwen3-Coder-Next port had one maintained expert path.
 
 How to test this milestone:
 1. Build the binaries:
    ```bash
    cd metal_infer
    make infer metal_infer chat
+   ```
+
+### Step 9: Remove dead 2-bit runtime path
+What changed:
+- Deleted the obsolete [metal_infer/repack_experts_2bit.py](/Users/sk/dev/flash-moe/metal_infer/repack_experts_2bit.py) script.
+- Removed the 2-bit runtime state, CLI flag, auto-detection, and Metal pipeline from [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m).
+- Removed the unused `dequant_matvec_2bit` kernel from [metal_infer/shaders.metal](/Users/sk/dev/flash-moe/metal_infer/shaders.metal).
+- Simplified expert-file loading so the runtime only opens `packed_experts/layer_XX.bin`.
+- Switched the CPU fallback in [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m) to use the shared runtime expert-layout helper instead of stale hardcoded offsets.
+- Updated [README.md](/Users/sk/dev/flash-moe/README.md) and [RUN_QWEN3_CODER_NEXT.md](/Users/sk/dev/flash-moe/RUN_QWEN3_CODER_NEXT.md) to describe the runtime as q4-only instead of “2-bit unsupported”.
+
+What still blocks correctness:
+- No end-to-end Qwen3-Coder-Next prompt run has been validated on Apple Silicon in this workspace.
+- [tools/reference_compare.py](/Users/sk/dev/flash-moe/tools/reference_compare.py) is partial; it does not yet prove full-model equivalence to Hugging Face.
+- [metal_infer/main.m](/Users/sk/dev/flash-moe/metal_infer/main.m) still needs the same cleanup standard as [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m) if it will remain part of the supported surface area.
+
+How to test this milestone:
+1. Rebuild the runtime:
+   ```bash
+   cd metal_infer
+   make infer
+   ```
+2. Confirm the dead 2-bit path is gone from the active Qwen docs and runtime:
+   ```bash
+   rg -n "2bit|packed_experts_2bit|dequant_matvec_2bit|matvec_2bit|g_use_2bit" metal_infer README.md RUN_QWEN3_CODER_NEXT.md
+   ```
+3. Check the CLI no longer advertises the removed flag:
+   ```bash
+   cd metal_infer
+   ./infer --help
    ```
 2. Check the benchmark CLI defaults:
    ```bash
@@ -434,7 +462,6 @@ What changed:
 
 What still blocks correctness:
 - The guide documents the current intended run path, but I still have not executed a full Qwen3-Coder-Next prompt on a real Metal device in this environment.
-- `tools/reference_compare.py` remains missing.
 - Runtime performance/correctness for the fused linear-attention path is still not cross-checked layer-by-layer against Hugging Face.
 
 How to test this milestone:
@@ -448,3 +475,45 @@ How to test this milestone:
    make infer
    ```
 3. Follow [RUN_QWEN3_CODER_NEXT.md](/Users/sk/dev/flash-moe/RUN_QWEN3_CODER_NEXT.md) from top to bottom on a real Apple Silicon machine with the downloaded model.
+
+### Step 8: Partial reference comparison harness and runtime dump hooks
+What changed:
+- Added [tools/reference_compare.py](/Users/sk/dev/flash-moe/tools/reference_compare.py).
+  - It compares runtime dumps against source BF16 tensors without loading the full model.
+  - Current comparisons:
+    - last prompt-token embedding
+    - per-layer router logits
+    - per-layer top-k routing overlap
+    - per-layer shared expert pre-gate output
+    - final logits from the dumped final hidden state
+- Added runtime dump support in [metal_infer/infer.m](/Users/sk/dev/flash-moe/metal_infer/infer.m):
+  - new flag: `--dump-dir PATH`
+  - dumps the last prompt-position checkpoints needed by the reference harness
+- Updated [RUN_QWEN3_CODER_NEXT.md](/Users/sk/dev/flash-moe/RUN_QWEN3_CODER_NEXT.md) to document:
+  - runtime dump generation
+  - running the comparison harness
+
+What still blocks correctness:
+- The comparison harness is partial. It does not yet run a full Hugging Face forward pass for end-to-end token-by-token comparison.
+- No real Apple Silicon runtime dump has been produced in this environment yet.
+- Metal-kernel correctness is still not proven until the dumped runtime tensors are compared on a real converted model run.
+
+How to test this milestone:
+1. Validate the new comparison tool:
+   ```bash
+   python3 tools/reference_compare.py --help
+   ```
+2. Rebuild the runtime and confirm the dump flag exists:
+   ```bash
+   cd metal_infer
+   make infer
+   ./infer --help
+   ```
+3. On a real Apple Silicon machine with the converted model, run:
+   ```bash
+   ./infer --model "$QWEN3_CODER_NEXT_MODEL_PATH" --prompt "Hello" --tokens 1 --k 10 --dump-dir /tmp/qwen3-next-dump
+   ```
+4. Then compare:
+   ```bash
+   python3 tools/reference_compare.py --model "$QWEN3_CODER_NEXT_MODEL_PATH" --dump-dir /tmp/qwen3-next-dump --layers 0,1,47
+   ```

@@ -18,11 +18,13 @@ What is implemented:
 - tokenizer export into `tokenizer.bin`
 - vocab export into `vocab.bin`
 - runtime defaults for `48` layers and `K=10`
+- runtime dump hooks for last-prompt-position comparison
+- partial reference comparison against source BF16 tensors
 
 What is still not fully validated:
 - a full on-device correctness comparison against Hugging Face
 - a complete end-to-end generation run in this sandbox
-- `2-bit` expert mode for Qwen3-Coder-Next
+- final quality and performance measurements on real Apple Silicon hardware
 
 Treat this as a working bring-up path, not a final polished release.
 
@@ -242,7 +244,72 @@ Useful debug flags:
   --cache-telemetry
 ```
 
-## 10. Run OpenAI-Compatible Server Mode
+## 10. Dump Comparison Tensors
+
+The runtime can now dump tensors for the last prompt position. This is intended
+for bring-up and accuracy debugging.
+
+It writes:
+- prompt token ids
+- the last prompt-token embedding
+- per-layer `h_post`
+- per-layer raw router logits
+- per-layer top-k routing
+- per-layer shared expert pre-gate output
+- final hidden state after final norm
+- final logits
+
+Example:
+
+```bash
+cd /Users/sk/dev/flash-moe/metal_infer
+export QWEN3_CODER_NEXT_MODEL_PATH=/Users/sk/dev/flash-moe/Qwen3-Coder-Next
+
+./infer \
+  --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+  --prompt "Write a Python function that reverses a linked list." \
+  --tokens 1 \
+  --k 10 \
+  --dump-dir /tmp/qwen3-next-dump
+```
+
+Expected output files include names like:
+
+```text
+/tmp/qwen3-next-dump/prompt_tokens.json
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__embedding.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__final_hidden.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__logits.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_router_logits.bin
+/tmp/qwen3-next-dump/prefill_last_pos_000000_tok_...__layer_00_topk.json
+```
+
+## 11. Compare Runtime Dumps Against Source BF16 Tensors
+
+The comparison harness does not need to load the full model into RAM. It reads
+only the source tensors needed for the dumped checkpoints.
+
+Current comparisons:
+- last-token embedding
+- per-layer router logits
+- per-layer router top-k overlap
+- per-layer shared expert pre-gate output
+- final logits from dumped final hidden state
+
+Example:
+
+```bash
+python3 /Users/sk/dev/flash-moe/tools/reference_compare.py \
+  --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
+  --dump-dir /tmp/qwen3-next-dump \
+  --layers 0,1,2,47 \
+  --output /tmp/qwen3-next-compare.json
+```
+
+This prints per-checkpoint error summaries and writes a JSON report if
+`--output` is provided.
+
+## 12. Run OpenAI-Compatible Server Mode
 
 ```bash
 cd /Users/sk/dev/flash-moe/metal_infer
@@ -329,6 +396,6 @@ The manifest does not match the compiled runtime assumptions. Recreate `model_we
 
 ## Known Limitations
 
-- `--2bit` is not supported for this Qwen3-Coder-Next path.
-- The repo still lacks `tools/reference_compare.py`.
+- This port only supports the q4 packed-expert path under `packed_experts/`.
+- The reference comparison path is partial. It compares dumped checkpoints against source BF16 tensors, not a full end-to-end Hugging Face forward pass.
 - This document reflects the current bring-up state of the port, not a fully performance-tuned or correctness-proven release.

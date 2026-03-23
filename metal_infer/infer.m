@@ -105,19 +105,6 @@
 // Expert packed binary layout for Qwen3-Coder-Next q4
 #define EXPERT_SIZE         1769472
 
-// 2-bit expert layout (from repack_experts_2bit.py)
-// Unsupported for Qwen3-Coder-Next; kept only to preserve older CLI parsing.
-#define EXPERT_SIZE_2BIT    3932160
-#define GATE_W_OFF_2  0
-#define GATE_S_OFF_2  1048576
-#define GATE_B_OFF_2  1179648
-#define UP_W_OFF_2    1310720
-#define UP_S_OFF_2    2359296
-#define UP_B_OFF_2    2490368
-#define DOWN_W_OFF_2  2621440
-#define DOWN_S_OFF_2  3670016
-#define DOWN_B_OFF_2  3801088
-
 // KV cache maximum context length
 #define MAX_SEQ_LEN 1048576  // 1M context — only 15 full-attn layers need KV cache, ~15GB at max
 #define GPU_KV_SEQ  8192     // GPU KV buffer pre-allocation (grows if exceeded, falls back to CPU attn)
@@ -355,7 +342,6 @@ static int g_use_lz4 = 0;                        // auto-detected from packed_ex
 
 static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (layer, expert)
 static int g_freq_tracking = 0;  // enabled by --freq flag
-static int g_use_2bit = 0;       // enabled by --2bit flag: use packed_experts_2bit/ + 2-bit kernel
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
 
@@ -374,20 +360,6 @@ typedef struct {
 
 static inline ExpertLayout runtime_expert_layout(void) {
     ExpertLayout layout = {0};
-    if (g_use_2bit) {
-        layout.expert_size = EXPERT_SIZE_2BIT;
-        layout.gate_w_off = GATE_W_OFF_2;
-        layout.gate_s_off = GATE_S_OFF_2;
-        layout.gate_b_off = GATE_B_OFF_2;
-        layout.up_w_off = UP_W_OFF_2;
-        layout.up_s_off = UP_S_OFF_2;
-        layout.up_b_off = UP_B_OFF_2;
-        layout.down_w_off = DOWN_W_OFF_2;
-        layout.down_s_off = DOWN_S_OFF_2;
-        layout.down_b_off = DOWN_B_OFF_2;
-        return layout;
-    }
-
     int hidden_dim = runtime_hidden_size();
     int moe_intermediate = runtime_moe_intermediate();
     int hidden_groups = (hidden_dim + GROUP_SIZE - 1) / GROUP_SIZE;
@@ -441,7 +413,7 @@ static inline int expert_pick_fd(int layer, int expert, int warm_fd) {
     return warm_fd;
 }
 
-// Active expert size based on quantization mode
+// Active expert size for the Qwen3-Coder-Next q4 expert blob layout.
 static inline size_t active_expert_size(void) {
     return runtime_expert_layout().expert_size;
 }
@@ -986,6 +958,174 @@ typedef struct {
     int count;
 } PromptTokens;
 
+typedef struct {
+    int enabled;
+    int step_active;
+    int prompt_written;
+    char dir[1024];
+    char step_prefix[256];
+    char step_phase[64];
+    int step_pos;
+    int step_input_token;
+} RuntimeDumpState;
+
+static RuntimeDumpState g_runtime_dump = {0};
+
+static int runtime_dump_ensure_dir(void) {
+    if (!g_runtime_dump.enabled) return 0;
+    @autoreleasepool {
+        NSString *dir = [NSString stringWithUTF8String:g_runtime_dump.dir];
+        NSError *error = nil;
+        BOOL ok = [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                                            withIntermediateDirectories:YES
+                                                             attributes:nil
+                                                                  error:&error];
+        if (!ok) {
+            fprintf(stderr, "WARNING: failed to create dump dir %s: %s\n",
+                    g_runtime_dump.dir,
+                    error ? [[error localizedDescription] UTF8String] : "unknown");
+            g_runtime_dump.enabled = 0;
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void runtime_dump_enable(const char *dir) {
+    if (!dir || !dir[0]) return;
+    memset(&g_runtime_dump, 0, sizeof(g_runtime_dump));
+    strncpy(g_runtime_dump.dir, dir, sizeof(g_runtime_dump.dir) - 1);
+    g_runtime_dump.enabled = 1;
+    runtime_dump_ensure_dir();
+    if (g_runtime_dump.enabled) {
+        fprintf(stderr, "[dump] enabled: %s\n", g_runtime_dump.dir);
+    }
+}
+
+static void runtime_dump_write_json_text(const char *path, const char *json_text) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "WARNING: failed to write dump file %s\n", path);
+        return;
+    }
+    fputs(json_text, f);
+    fclose(f);
+}
+
+static void runtime_dump_write_f32_named(const char *name, const float *data, int count) {
+    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active || !data || count <= 0) return;
+    char bin_path[1536], meta_path[1536], meta_json[256];
+    snprintf(bin_path, sizeof(bin_path), "%s/%s__%s.bin",
+             g_runtime_dump.dir, g_runtime_dump.step_prefix, name);
+    snprintf(meta_path, sizeof(meta_path), "%s/%s__%s.json",
+             g_runtime_dump.dir, g_runtime_dump.step_prefix, name);
+
+    FILE *f = fopen(bin_path, "wb");
+    if (!f) {
+        fprintf(stderr, "WARNING: failed to write dump tensor %s\n", bin_path);
+        return;
+    }
+    fwrite(data, sizeof(float), count, f);
+    fclose(f);
+
+    snprintf(meta_json, sizeof(meta_json),
+             "{\n  \"dtype\": \"f32\",\n  \"shape\": [%d],\n  \"count\": %d\n}\n",
+             count, count);
+    runtime_dump_write_json_text(meta_path, meta_json);
+}
+
+static void runtime_dump_write_layer_f32(int layer_idx, const char *name, const float *data, int count) {
+    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+    char tensor_name[256];
+    snprintf(tensor_name, sizeof(tensor_name), "layer_%02d_%s", layer_idx, name);
+    runtime_dump_write_f32_named(tensor_name, data, count);
+}
+
+static void runtime_dump_write_layer_scalar(int layer_idx, const char *name, float value) {
+    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+    char path[1536], json_text[256];
+    snprintf(path, sizeof(path), "%s/%s__layer_%02d_%s.json",
+             g_runtime_dump.dir, g_runtime_dump.step_prefix, layer_idx, name);
+    snprintf(json_text, sizeof(json_text), "{\n  \"value\": %.9g\n}\n", value);
+    runtime_dump_write_json_text(path, json_text);
+}
+
+static void runtime_dump_write_layer_topk(int layer_idx, const int *indices, const float *weights, int K) {
+    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+    char path[1536];
+    snprintf(path, sizeof(path), "%s/%s__layer_%02d_topk.json",
+             g_runtime_dump.dir, g_runtime_dump.step_prefix, layer_idx);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "WARNING: failed to write dump topk %s\n", path);
+        return;
+    }
+    fprintf(f, "{\n  \"k\": %d,\n  \"indices\": [", K);
+    for (int i = 0; i < K; i++) {
+        if (i) fputs(", ", f);
+        fprintf(f, "%d", indices[i]);
+    }
+    fputs("],\n  \"weights\": [", f);
+    for (int i = 0; i < K; i++) {
+        if (i) fputs(", ", f);
+        fprintf(f, "%.9g", weights[i]);
+    }
+    fputs("]\n}\n", f);
+    fclose(f);
+}
+
+static void runtime_dump_begin_step(const char *phase, int pos, int input_token_id) {
+    if (!g_runtime_dump.enabled) return;
+    g_runtime_dump.step_active = 1;
+    g_runtime_dump.step_pos = pos;
+    g_runtime_dump.step_input_token = input_token_id;
+    strncpy(g_runtime_dump.step_phase, phase ? phase : "step", sizeof(g_runtime_dump.step_phase) - 1);
+    snprintf(g_runtime_dump.step_prefix, sizeof(g_runtime_dump.step_prefix),
+             "%s_pos_%06d_tok_%d",
+             g_runtime_dump.step_phase, pos, input_token_id);
+
+    char path[1536], json_text[512];
+    snprintf(path, sizeof(path), "%s/%s__meta.json",
+             g_runtime_dump.dir, g_runtime_dump.step_prefix);
+    snprintf(json_text, sizeof(json_text),
+             "{\n  \"phase\": \"%s\",\n  \"position\": %d,\n  \"input_token_id\": %d\n}\n",
+             g_runtime_dump.step_phase, pos, input_token_id);
+    runtime_dump_write_json_text(path, json_text);
+}
+
+static void runtime_dump_finish_step(int next_token_id) {
+    if (!g_runtime_dump.enabled || !g_runtime_dump.step_active) return;
+    char path[1536], json_text[512];
+    snprintf(path, sizeof(path), "%s/%s__result.json",
+             g_runtime_dump.dir, g_runtime_dump.step_prefix);
+    snprintf(json_text, sizeof(json_text),
+             "{\n  \"phase\": \"%s\",\n  \"position\": %d,\n  \"input_token_id\": %d,\n  \"next_token_id\": %d\n}\n",
+             g_runtime_dump.step_phase, g_runtime_dump.step_pos,
+             g_runtime_dump.step_input_token, next_token_id);
+    runtime_dump_write_json_text(path, json_text);
+    g_runtime_dump.step_active = 0;
+    g_runtime_dump.step_prefix[0] = '\0';
+}
+
+static void runtime_dump_write_prompt_tokens(const PromptTokens *pt) {
+    if (!g_runtime_dump.enabled || g_runtime_dump.prompt_written || !pt) return;
+    char path[1536];
+    snprintf(path, sizeof(path), "%s/prompt_tokens.json", g_runtime_dump.dir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        fprintf(stderr, "WARNING: failed to write prompt tokens %s\n", path);
+        return;
+    }
+    fprintf(f, "{\n  \"count\": %d,\n  \"ids\": [", pt->count);
+    for (int i = 0; i < pt->count; i++) {
+        if (i) fputs(", ", f);
+        fprintf(f, "%u", pt->ids[i]);
+    }
+    fputs("]\n}\n", f);
+    fclose(f);
+    g_runtime_dump.prompt_written = 1;
+}
+
 static PromptTokens *load_prompt_tokens(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) return NULL;
@@ -1283,7 +1423,6 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
-    id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1420,7 +1559,6 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
-    ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1881,7 +2019,7 @@ static void gpu_encode_expert_forward_slot(
     int k  // slot index
 ) {
     ExpertLayout layout = runtime_expert_layout();
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
 
     uint32_t gate_up_out = (uint32_t)runtime_moe_intermediate();
     uint32_t gate_up_in  = (uint32_t)runtime_hidden_size();
@@ -1966,7 +2104,7 @@ static void gpu_encode_expert_forward_slot_buf(
     id<MTLBuffer> data_buf  // expert weight data buffer (from either set A or B)
 ) {
     ExpertLayout layout = runtime_expert_layout();
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
 
     uint32_t gate_up_out = (uint32_t)runtime_moe_intermediate();
     uint32_t gate_up_in  = (uint32_t)runtime_hidden_size();
@@ -2054,16 +2192,13 @@ static void gpu_encode_experts_batched(
     id<MTLBuffer> __strong *expert_bufs   // per-expert weight data buffers [MAX_K]
 ) {
     ExpertLayout layout = runtime_expert_layout();
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
 
     uint32_t gate_up_out = (uint32_t)runtime_moe_intermediate();
     uint32_t gate_up_in  = (uint32_t)runtime_hidden_size();
     uint32_t down_out    = (uint32_t)runtime_hidden_size();
     uint32_t down_in     = (uint32_t)runtime_moe_intermediate();
     uint32_t gs          = GROUP_SIZE;
-    // 2-bit: packed_cols = in_dim/16, threadgroups = out_dim/8
-    // 4-bit: packed_cols = in_dim/8,  threadgroups = out_dim/8
-    // Threadgroup count is the same (based on out_dim), kernel handles packed_cols internally.
     uint32_t gate_up_tgs = (gate_up_out + 7) / 8;
     uint32_t down_tgs    = (down_out + 7) / 8;
     uint32_t swiglu_tgs  = (gate_up_out + 255) / 256;
@@ -2242,7 +2377,7 @@ static void gpu_expert_forward(
     int expert_data_already_in_buffer
 ) {
     ExpertLayout layout = runtime_expert_layout();
-    id<MTLComputePipelineState> expert_pipe = g_use_2bit ? ctx->matvec_2bit : ctx->matvec_v3;
+    id<MTLComputePipelineState> expert_pipe = ctx->matvec_v3;
 
     // Copy expert weights into Metal buffer only if not already there
     if (!expert_data_already_in_buffer) {
@@ -2845,15 +2980,16 @@ static void moe_forward(
                     continue;
                 }
 
-                uint32_t *gw = (uint32_t *)expert_data;
-                uint16_t *gs_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_S_OFF_2 : 2097152));
-                uint16_t *gb_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? GATE_B_OFF_2 : 2228224));
-                uint32_t *uw = (uint32_t *)((char *)expert_data + (g_use_2bit ? UP_W_OFF_2 : 2359296));
-                uint16_t *us_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_S_OFF_2 : 4456448));
-                uint16_t *ub_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? UP_B_OFF_2 : 4587520));
-                uint32_t *dw = (uint32_t *)((char *)expert_data + (g_use_2bit ? DOWN_W_OFF_2 : 4718592));
-                uint16_t *ds_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_S_OFF_2 : 6815744));
-                uint16_t *db_p = (uint16_t *)((char *)expert_data + (g_use_2bit ? DOWN_B_OFF_2 : 6946816));
+                ExpertLayout layout = runtime_expert_layout();
+                uint32_t *gw = (uint32_t *)((char *)expert_data + layout.gate_w_off);
+                uint16_t *gs_p = (uint16_t *)((char *)expert_data + layout.gate_s_off);
+                uint16_t *gb_p = (uint16_t *)((char *)expert_data + layout.gate_b_off);
+                uint32_t *uw = (uint32_t *)((char *)expert_data + layout.up_w_off);
+                uint16_t *us_p = (uint16_t *)((char *)expert_data + layout.up_s_off);
+                uint16_t *ub_p = (uint16_t *)((char *)expert_data + layout.up_b_off);
+                uint32_t *dw = (uint32_t *)((char *)expert_data + layout.down_w_off);
+                uint16_t *ds_p = (uint16_t *)((char *)expert_data + layout.down_s_off);
+                uint16_t *db_p = (uint16_t *)((char *)expert_data + layout.down_b_off);
 
                 float *gate_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
                 float *up_proj_out = malloc(MOE_INTERMEDIATE * sizeof(float));
@@ -3938,6 +4074,13 @@ static void finalize_deferred_experts(void) {
     int hidden_dim = runtime_hidden_size();
 
     if (g_deferred.gpu_combined) {
+        if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
+            runtime_dump_write_layer_f32(g_deferred.layer_idx, "shared_out_pre_gate",
+                                         (const float *)[g_metal->buf_shared_out contents],
+                                         hidden_dim);
+            runtime_dump_write_layer_scalar(g_deferred.layer_idx, "shared_gate_score",
+                                            g_deferred.shared_gate_score);
+        }
         // GPU-side combine: hidden state is already in buf_moe_hidden.
         // buf_input already has the normalized input for the next layer's CMD1.
         // Just read back hidden (needed for the residual connection in future layers).
@@ -3957,6 +4100,12 @@ static void finalize_deferred_experts(void) {
         // Read shared expert result
         float shared_out[hidden_dim];
         memcpy(shared_out, [g_metal->buf_shared_out contents], hidden_dim * sizeof(float));
+        if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
+            runtime_dump_write_layer_f32(g_deferred.layer_idx, "shared_out_pre_gate",
+                                         shared_out, hidden_dim);
+            runtime_dump_write_layer_scalar(g_deferred.layer_idx, "shared_gate_score",
+                                            g_deferred.shared_gate_score);
+        }
 
         // Apply shared expert gate
         float shared_weight = cpu_sigmoid(g_deferred.shared_gate_score);
@@ -5145,6 +5294,12 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
     }
 
+    if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
+        runtime_dump_write_layer_f32(layer_idx, "h_post", h_post, hidden_dim);
+        runtime_dump_write_layer_f32(layer_idx, "router_logits", gate_scores, num_experts);
+        runtime_dump_write_layer_scalar(layer_idx, "shared_gate_score", shared_gate_score);
+    }
+
     // ---- Softmax + top-K (CPU) ----
     if (g_timing_enabled) { t0 = now_ms(); }
     cpu_softmax(gate_scores, num_experts);
@@ -5170,6 +5325,10 @@ static void fused_layer_forward(
                 }
             }
         }
+    }
+
+    if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
+        runtime_dump_write_layer_topk(layer_idx, expert_indices, expert_weights, K);
     }
 
     if (g_timing_enabled) { t1 = now_ms(); g_timing.routing_cpu += t1 - t0; }
@@ -5595,7 +5754,7 @@ static void fused_layer_forward(
                 continue;
             }
 
-            // CPU fallback offsets — use 4-bit layout (2-bit CPU path not yet implemented)
+            // CPU fallback offsets use the runtime q4 expert layout.
             uint32_t *gw = (uint32_t *)expert_data;
             uint16_t *gs_p = (uint16_t *)((char *)expert_data + expert_layout.gate_s_off);
             uint16_t *gb_p = (uint16_t *)((char *)expert_data + expert_layout.gate_b_off);
@@ -5647,6 +5806,10 @@ static void fused_layer_forward(
     }
 
     // ---- Shared expert gate ----
+    if (g_runtime_dump.enabled && g_runtime_dump.step_active) {
+        runtime_dump_write_layer_f32(layer_idx, "shared_out_pre_gate", shared_out, hidden_dim);
+        runtime_dump_write_layer_scalar(layer_idx, "shared_gate_score", shared_gate_score);
+    }
     float shared_weight = cpu_sigmoid(shared_gate_score);
     for (int i = 0; i < hidden_dim; i++) {
         shared_out[i] *= shared_weight;
@@ -6620,6 +6783,7 @@ static void print_usage(const char *prog) {
     printf("  --weights PATH       model_weights.bin path\n");
     printf("  --manifest PATH      model_weights.json path\n");
     printf("  --vocab PATH         vocab.bin path\n");
+    printf("  --dump-dir PATH      Dump comparison tensors for last prompt position\n");
     printf("  --prompt-tokens PATH prompt_tokens.bin path\n");
     printf("  --prompt TEXT         Prompt text (uses tokenizer.bin)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
@@ -6630,7 +6794,6 @@ static void print_usage(const char *prog) {
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
-    printf("  --2bit               Unsupported for Qwen3-Coder-Next (reserved)\n");
     printf("  --gpu-linear         Alias for the fused GPU delta-net path (default)\n");
     printf("  --predict            Enable temporal expert prediction (prefetch during CMD1_wait)\n");
     printf("  --collect-routing F  Log routing data to binary file F (for predictor training)\n");
@@ -6638,6 +6801,10 @@ static void print_usage(const char *prog) {
     printf("  --serve PORT         Run HTTP server (OpenAI-compatible API)\n");
     printf("  --help               This message\n");
 }
+
+enum {
+    OPT_DUMP_DIR = 1000,
+};
 
 int main(int argc, char **argv) {
     @autoreleasepool {
@@ -6659,6 +6826,7 @@ int main(int argc, char **argv) {
             {"weights",       required_argument, 0, 'w'},
             {"manifest",      required_argument, 0, 'j'},
             {"vocab",         required_argument, 0, 'v'},
+            {"dump-dir",      required_argument, 0, OPT_DUMP_DIR},
             {"prompt-tokens", required_argument, 0, 'p'},
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
@@ -6670,7 +6838,6 @@ int main(int argc, char **argv) {
             {"timing",        no_argument,       0, 'T'},
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
-            {"2bit",          no_argument,       0, '2'},
             {"gpu-linear",    no_argument,       0, 'G'},
             {"think-budget",  required_argument, 0, 'B'},
             {"serve",         required_argument, 0, 'R'},
@@ -6681,12 +6848,13 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFEGh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
                 case 'j': manifest_path = optarg; break;
                 case 'v': vocab_path = optarg; break;
+                case OPT_DUMP_DIR: runtime_dump_enable(optarg); break;
                 case 'p': prompt_tokens_path = optarg; break;
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
@@ -6698,9 +6866,6 @@ int main(int argc, char **argv) {
                 case 'T': g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
-                case '2':
-                    fprintf(stderr, "ERROR: --2bit is not supported for Qwen3-Coder-Next\n");
-                    return 1;
                 case 'G': gpu_linear_attn_enabled = 1; break;
                 case 'D': g_pred_enabled = 1; break;
                 case 'Z':
@@ -6788,7 +6953,7 @@ int main(int argc, char **argv) {
         printf("Manifest: %s\n", manifest_path);
         printf("Vocab:    %s\n", vocab_path);
         printf("K:        %d experts/layer\n", K);
-        printf("Quant:    %s experts (%zu bytes each)\n", g_use_2bit ? "2-bit" : "4-bit", active_expert_size());
+        printf("Quant:    4-bit experts (%zu bytes each)\n", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
@@ -6844,29 +7009,12 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "ERROR: Failed to load prompt tokens from %s\n", prompt_tokens_path);
                 return 1;
             }
+            runtime_dump_write_prompt_tokens(pt);
             printf("[prompt] %d tokens:", pt->count);
             for (int i = 0; i < pt->count && i < 20; i++) {
                 printf(" %d", pt->ids[i]);
             }
             printf("\n");
-        }
-
-        // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit) {
-            char probe[1024];
-            snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
-            int pfd = open(probe, O_RDONLY);
-            if (pfd >= 0) {
-                close(pfd);
-                snprintf(probe, sizeof(probe), "%s/packed_experts/layer_00.bin", model_path);
-                int pfd4 = open(probe, O_RDONLY);
-                if (pfd4 < 0) {
-                    g_use_2bit = 1;
-                    printf("[auto] Using 2-bit experts (4-bit not found)\n");
-                } else {
-                    close(pfd4);
-                }
-            }
         }
 
         // ---- Open + mmap packed expert files ----
@@ -6887,8 +7035,7 @@ int main(int argc, char **argv) {
 
         for (int i = 0; i < runtime_num_layers(); i++) {
             char path[1024];
-            snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
-                     g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
+            snprintf(path, sizeof(path), "%s/packed_experts/layer_%02d.bin", model_path, i);
             layer_fds[i] = open(path, O_RDONLY);
             layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
@@ -6918,7 +7065,7 @@ int main(int argc, char **argv) {
         {
             char lz4_probe[1024];
             snprintf(lz4_probe, sizeof(lz4_probe), "%s/packed_experts_lz4/layer_00.bin", model_path);
-            if (!g_use_2bit && access(lz4_probe, R_OK) == 0) {
+            if (access(lz4_probe, R_OK) == 0) {
                 int lz4_layers = 0;
                 for (int i = 0; i < runtime_num_layers(); i++) {
                     char lz4_path[1024];
@@ -7073,6 +7220,8 @@ int main(int argc, char **argv) {
         // ---- Last prefill token (or single-token prompt) ----
         // This one needs full completion since we need hidden state for logits.
         {
+            int dump_input_token = embed_batch ? (int)pt->ids[pt->count - 1] : (int)pt->ids[0];
+            runtime_dump_begin_step("prefill_last", pos, dump_input_token);
             cache_telemetry_note_token();
             if (embed_batch) {
                 memcpy(hidden, embed_batch + (size_t)(pt->count - 1) * HIDDEN_DIM,
@@ -7080,6 +7229,7 @@ int main(int argc, char **argv) {
             } else {
                 embed_lookup(wf, pt->ids[0], hidden);
             }
+            runtime_dump_write_f32_named("embedding", hidden, runtime_hidden_size());
 
             for (int layer = 0; layer < runtime_num_layers(); layer++) {
                 int is_full = runtime_layer_is_full(layer);
@@ -7109,9 +7259,12 @@ int main(int argc, char **argv) {
         double t_lm = now_ms();
         lm_head_forward(wf, hidden, logits);
         double lm_ms = now_ms() - t_lm;
+        runtime_dump_write_f32_named("final_hidden", hidden, runtime_hidden_size());
+        runtime_dump_write_f32_named("logits", logits, runtime_vocab_size());
 
         // ---- Sample first token ----
         int next_token = cpu_argmax(logits, VOCAB_SIZE);
+        runtime_dump_finish_step(next_token);
         double ttft_ms = now_ms() - t0;
 
         // Debug: show top-5 logits for first token
