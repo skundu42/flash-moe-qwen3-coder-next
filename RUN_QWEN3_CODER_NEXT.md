@@ -64,7 +64,7 @@ hf auth login
 From the repo root:
 
 ```bash
-cd /Users/sk/dev/flash-moe
+cd /path/to/flash-moe
 hf download Qwen/Qwen3-Coder-Next --local-dir ./Qwen3-Coder-Next
 ```
 
@@ -188,14 +188,14 @@ This verifies:
 ## 8. Build The Runtime
 
 ```bash
-cd /Users/sk/dev/flash-moe/metal_infer
+cd metal_infer
 make infer chat
 ```
 
 If the build succeeds, the main runtime binary is:
 
 ```text
-/Users/sk/dev/flash-moe/metal_infer/infer
+metal_infer/infer
 ```
 
 ## 9. Run A First Prompt
@@ -209,8 +209,8 @@ The runtime now looks in the model directory first for:
 So the shortest working invocation is:
 
 ```bash
-cd /Users/sk/dev/flash-moe/metal_infer
-export QWEN3_CODER_NEXT_MODEL_PATH=/Users/sk/dev/flash-moe/Qwen3-Coder-Next
+cd metal_infer
+export QWEN3_CODER_NEXT_MODEL_PATH="../Qwen3-Coder-Next"
 
 ./infer \
   --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
@@ -260,8 +260,8 @@ It writes:
 Example:
 
 ```bash
-cd /Users/sk/dev/flash-moe/metal_infer
-export QWEN3_CODER_NEXT_MODEL_PATH=/Users/sk/dev/flash-moe/Qwen3-Coder-Next
+cd metal_infer
+export QWEN3_CODER_NEXT_MODEL_PATH="../Qwen3-Coder-Next"
 
 ./infer \
   --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
@@ -313,7 +313,7 @@ Current comparisons:
 Example:
 
 ```bash
-python3 /Users/sk/dev/flash-moe/tools/reference_compare.py \
+python3 tools/reference_compare.py \
   --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
   --dump-dir /tmp/qwen3-next-dump \
   --layers 0,1,2,47 \
@@ -327,7 +327,7 @@ failure, so it can be used as a regression gate.
 ## 12. Run The Canned Validation Suite
 
 ```bash
-python3 /Users/sk/dev/flash-moe/tools/validate_qwen3_next_runtime.py \
+python3 tools/validate_qwen3_next_runtime.py \
   --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
   --output /tmp/qwen3-next-validation.json
 ```
@@ -338,8 +338,8 @@ runtime output, and runs `reference_compare.py` on the first pass of each prompt
 ## 13. Run OpenAI-Compatible Server Mode
 
 ```bash
-cd /Users/sk/dev/flash-moe/metal_infer
-export QWEN3_CODER_NEXT_MODEL_PATH=/Users/sk/dev/flash-moe/Qwen3-Coder-Next
+cd metal_infer
+export QWEN3_CODER_NEXT_MODEL_PATH="../Qwen3-Coder-Next"
 
 ./infer \
   --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
@@ -375,7 +375,7 @@ You did not generate `vocab.bin`, or the runtime is not looking in the right dir
 Fix:
 
 ```bash
-python3 /Users/sk/dev/flash-moe/metal_infer/export_tokenizer.py \
+python3 metal_infer/export_tokenizer.py \
   --model-dir "$QWEN3_CODER_NEXT_MODEL_PATH"
 ```
 
@@ -386,7 +386,7 @@ Prompt encoding with `--prompt` requires `tokenizer.bin`.
 Fix:
 
 ```bash
-python3 /Users/sk/dev/flash-moe/metal_infer/export_tokenizer.py \
+python3 metal_infer/export_tokenizer.py \
   --model-dir "$QWEN3_CODER_NEXT_MODEL_PATH"
 ```
 
@@ -404,10 +404,10 @@ $QWEN3_CODER_NEXT_MODEL_PATH/packed_experts/layer_00.bin
 If you wrote to `packed_experts_q4/`, rerun:
 
 ```bash
-python3 /Users/sk/dev/flash-moe/repack_experts.py \
+python3 repack_experts.py \
   --mode qwen3-next \
   --model "$QWEN3_CODER_NEXT_MODEL_PATH" \
-  --summary /Users/sk/dev/flash-moe/artifacts/qwen3_coder_next_model_summary.json \
+  --summary artifacts/qwen3_coder_next_model_summary.json \
   --output "$QWEN3_CODER_NEXT_MODEL_PATH/packed_experts" \
   --layers all
 ```

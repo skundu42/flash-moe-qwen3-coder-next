@@ -50,7 +50,7 @@ python3 -m pip install -U "huggingface_hub[cli]" numpy
 Download the model locally:
 
 ```bash
-cd /Users/sk/dev/flash-moe
+cd /path/to/flash-moe
 hf download Qwen/Qwen3-Coder-Next --local-dir ./Qwen3-Coder-Next
 export QWEN3_CODER_NEXT_MODEL_PATH="$PWD/Qwen3-Coder-Next"
 ```

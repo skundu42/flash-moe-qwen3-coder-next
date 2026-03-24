@@ -147,8 +147,8 @@ Each packed output directory also contains `layout.json` with:
 - logical and packed shapes
 
 This file is the contract for:
-- [repack_experts.py](/Users/sk/dev/flash-moe/repack_experts.py)
-- [tools/verify_packed_weights.py](/Users/sk/dev/flash-moe/tools/verify_packed_weights.py)
+- [repack_experts.py](repack_experts.py)
+- [tools/verify_packed_weights.py](tools/verify_packed_weights.py)
 - the upcoming runtime-side adapter work
 
 ## Verification path
