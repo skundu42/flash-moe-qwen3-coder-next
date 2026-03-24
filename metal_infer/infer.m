@@ -344,6 +344,14 @@ static int g_expert_freq[NUM_LAYERS][NUM_EXPERTS];  // activation count per (lay
 static int g_freq_tracking = 0;  // enabled by --freq flag
 static int g_cache_telemetry_enabled = 0;  // enabled by --cache-telemetry flag
 static int g_think_budget = 2048; // max thinking tokens before force-emitting </think>
+static int g_do_sample = 1;
+static int g_sampling_overridden = 0;
+static float g_temperature = 1.0f;
+static float g_top_p = 0.95f;
+static int g_top_k = 40;
+static int g_ram_lm_head = 0;
+static id<MTLBuffer> __strong g_lm_head_gpu_buf = nil;
+static int g_expert_cache_active = 1;
 
 typedef struct {
     size_t expert_size;
@@ -1510,7 +1518,7 @@ static void cpu_dequant_matvec(
     }
 }
 
-// RMS normalization: out = x * w / rms(x)
+// RMS normalization: out = x * (1 + w) / rms(x)
 static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int dim, float eps) {
     float sum_sq = 0.0f;
     for (int i = 0; i < dim; i++) {
@@ -1519,7 +1527,7 @@ static void cpu_rms_norm(const float *x, const uint16_t *w_bf16, float *out, int
     float rms = sqrtf(sum_sq / dim + eps);
     float inv_rms = 1.0f / rms;
     for (int i = 0; i < dim; i++) {
-        float weight = bf16_to_f32(w_bf16[i]);
+        float weight = 1.0f + bf16_to_f32(w_bf16[i]);
         out[i] = x[i] * inv_rms * weight;
     }
 }
@@ -1628,6 +1636,112 @@ static int cpu_argmax(const float *x, int dim) {
     return best;
 }
 
+typedef struct {
+    int idx;
+    float logit;
+    float prob;
+} SampleCandidate;
+
+static int sample_candidate_cmp_desc(const void *a, const void *b) {
+    const SampleCandidate *sa = (const SampleCandidate *)a;
+    const SampleCandidate *sb = (const SampleCandidate *)b;
+    if (sa->logit < sb->logit) return 1;
+    if (sa->logit > sb->logit) return -1;
+    return sa->idx - sb->idx;
+}
+
+static int cpu_sample_topk_topp(const float *logits, int dim, float temperature, int top_k, float top_p) {
+    if (dim <= 0) return 0;
+    if (temperature <= 0.0f || top_k == 1 || top_p <= 0.0f) {
+        return cpu_argmax(logits, dim);
+    }
+
+    int keep = top_k > 0 ? top_k : dim;
+    if (keep > dim) keep = dim;
+    SampleCandidate *cand = calloc((size_t)keep, sizeof(SampleCandidate));
+    if (!cand) return cpu_argmax(logits, dim);
+
+    int filled = 0;
+    for (int i = 0; i < dim; i++) {
+        float logit = logits[i];
+        if (filled < keep) {
+            cand[filled++] = (SampleCandidate){ .idx = i, .logit = logit, .prob = 0.0f };
+            continue;
+        }
+        int min_idx = 0;
+        for (int j = 1; j < keep; j++) {
+            if (cand[j].logit < cand[min_idx].logit) min_idx = j;
+        }
+        if (logit > cand[min_idx].logit) {
+            cand[min_idx].idx = i;
+            cand[min_idx].logit = logit;
+            cand[min_idx].prob = 0.0f;
+        }
+    }
+    qsort(cand, (size_t)filled, sizeof(SampleCandidate), sample_candidate_cmp_desc);
+
+    float inv_temp = 1.0f / temperature;
+    float max_scaled = cand[0].logit * inv_temp;
+    float prob_sum = 0.0f;
+    for (int i = 0; i < filled; i++) {
+        float scaled = cand[i].logit * inv_temp;
+        float p = expf(scaled - max_scaled);
+        cand[i].prob = p;
+        prob_sum += p;
+    }
+    if (prob_sum <= 0.0f || !isfinite(prob_sum)) {
+        int best = cand[0].idx;
+        free(cand);
+        return best;
+    }
+    for (int i = 0; i < filled; i++) cand[i].prob /= prob_sum;
+
+    int retained = filled;
+    if (top_p > 0.0f && top_p < 1.0f) {
+        float cumulative = 0.0f;
+        retained = 0;
+        for (int i = 0; i < filled; i++) {
+            cumulative += cand[i].prob;
+            retained++;
+            if (cumulative >= top_p && retained > 0) break;
+        }
+        float retained_sum = 0.0f;
+        for (int i = 0; i < retained; i++) retained_sum += cand[i].prob;
+        if (retained_sum > 0.0f) {
+            for (int i = 0; i < retained; i++) cand[i].prob /= retained_sum;
+        }
+    }
+
+    double u = ((double)arc4random() + 1.0) / ((double)UINT32_MAX + 2.0);
+    float cumulative = 0.0f;
+    int choice = cand[retained - 1].idx;
+    for (int i = 0; i < retained; i++) {
+        cumulative += cand[i].prob;
+        if (u <= cumulative) {
+            choice = cand[i].idx;
+            break;
+        }
+    }
+    free(cand);
+    return choice;
+}
+
+static int choose_next_token(const float *logits, int dim) {
+    int do_sample = g_do_sample;
+    if (!g_sampling_overridden && g_runtime_dump.enabled) {
+        do_sample = 0;
+    }
+    if (!do_sample) return cpu_argmax(logits, dim);
+    return cpu_sample_topk_topp(logits, dim, g_temperature, g_top_k, g_top_p);
+}
+
+static int should_skip_visible_token(int tok) {
+    return (tok == g_special_tokens.eos_token_1 ||
+            tok == g_special_tokens.eos_token_2 ||
+            tok == g_special_tokens.think_start_token ||
+            tok == g_special_tokens.think_end_token);
+}
+
 // SiLU activation
 static void cpu_silu(float *x, int dim) {
     for (int i = 0; i < dim; i++) {
@@ -1680,6 +1794,7 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v3;
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
+    id<MTLComputePipelineState> bf16_matvec;
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1816,6 +1931,7 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v3     = makePipe(@"dequant_matvec_4bit_v3");
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
+    ctx->bf16_matvec   = makePipe(@"bf16_matvec");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -2090,6 +2206,58 @@ static void gpu_dequant_matvec(
 
     // Copy result back
     memcpy(out_f32, [o_buf contents], o_size);
+}
+
+static void gpu_bf16_matvec_buffer(
+    MetalCtx *ctx,
+    id<MTLBuffer> w_buf,
+    NSUInteger w_off,
+    const float *x_f32,
+    float *out_f32,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    if (!ctx || !ctx->bf16_matvec || !w_buf) return;
+
+    memcpy([ctx->buf_input contents], x_f32, (size_t)in_dim * sizeof(float));
+
+    size_t o_size = (size_t)out_dim * sizeof(float);
+    id<MTLBuffer> o_buf = ctx->buf_output;
+    if (o_size > [o_buf length]) {
+        o_buf = [ctx->device newBufferWithLength:o_size options:MTLResourceStorageModeShared];
+    }
+
+    id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
+    [enc setComputePipelineState:ctx->bf16_matvec];
+    [enc setBuffer:w_buf          offset:w_off atIndex:0];
+    [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+    [enc setBuffer:o_buf          offset:0     atIndex:2];
+    [enc setBytes:&out_dim        length:4     atIndex:3];
+    [enc setBytes:&in_dim         length:4     atIndex:4];
+
+    const uint32_t rows_per_tg = 8;
+    MTLSize tg = MTLSizeMake(256, 1, 1);
+    MTLSize grid = MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, 1, 1);
+    [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+    [enc endEncoding];
+    [cmdbuf commit];
+    [cmdbuf waitUntilCompleted];
+
+    memcpy(out_f32, [o_buf contents], o_size);
+}
+
+static void gpu_bf16_matvec(
+    MetalCtx *ctx,
+    const void *W_bf16,
+    const float *x_f32,
+    float *out_f32,
+    uint32_t out_dim,
+    uint32_t in_dim
+) {
+    if (!ctx || !ctx->wf_buf) return;
+    NSUInteger w_off = (NSUInteger)((const char *)W_bf16 - (const char *)[ctx->wf_buf contents]);
+    gpu_bf16_matvec_buffer(ctx, ctx->wf_buf, w_off, x_f32, out_f32, out_dim, in_dim);
 }
 
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
@@ -3413,11 +3581,39 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     // Optimization: only compute top candidates
 
     TensorInfo *w_info = get_tensor_info(wf, "lm_head.weight");
+    if (!w_info) {
+        fprintf(stderr, "ERROR: lm_head.weight tensor not found\n");
+        return;
+    }
+
+    if (strcmp(w_info->dtype, "BF16") == 0) {
+        const uint16_t *W_bf16 = (const uint16_t *)((char *)wf->data + w_info->offset);
+        if (g_ram_lm_head) {
+            if (g_metal && g_metal->bf16_matvec && g_lm_head_gpu_buf) {
+                gpu_bf16_matvec_buffer(g_metal, g_lm_head_gpu_buf, 0, hidden, logits,
+                                       w_info->shape[0], w_info->shape[1]);
+                return;
+            }
+        }
+        if (g_metal && g_metal->bf16_matvec && g_metal->wf_buf) {
+            gpu_bf16_matvec(g_metal, W_bf16, hidden, logits, w_info->shape[0], w_info->shape[1]);
+            return;
+        }
+
+        float *lm_head_f32 = materialize_bf16_matrix_f32(W_bf16, w_info);
+        if (!lm_head_f32) {
+            fprintf(stderr, "ERROR: failed to materialize BF16 lm_head\n");
+            return;
+        }
+        cpu_f32_matvec(lm_head_f32, hidden, logits, w_info->shape[0], w_info->shape[1]);
+        free(lm_head_f32);
+        return;
+    }
+
     TensorInfo *s_info = get_tensor_info(wf, "lm_head.scales");
     TensorInfo *b_info = get_tensor_info(wf, "lm_head.biases");
-
-    if (!w_info || !s_info || !b_info) {
-        fprintf(stderr, "ERROR: lm_head tensors not found\n");
+    if (!s_info || !b_info) {
+        fprintf(stderr, "ERROR: quantized lm_head tensors not found\n");
         return;
     }
 
@@ -3628,7 +3824,7 @@ static int parallel_pread_experts(
     const void *mmap_base  // mmap'd layer file (NULL to use pread)
 ) {
     size_t esz = active_expert_size();
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K] = {0};
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [g_metal->buf_multi_expert_data[k] contents];
@@ -3664,7 +3860,7 @@ static int parallel_pread_experts_into(
     int *valid  // [MAX_K] output: 1 if expert loaded successfully
 ) {
     size_t esz = active_expert_size();
-    InferPreadTask tasks[MAX_K];
+    InferPreadTask tasks[MAX_K] = {0};
     for (int k = 0; k < K; k++) {
         tasks[k].fd = packed_fd;
         tasks[k].dst = [dst_bufs[k] contents];
@@ -4051,7 +4247,7 @@ static void *infer_prefetch_thread_fn(void *arg) {
         // Execute parallel pread (pure C, no ARC objects)
         size_t esz = active_expert_size();
         InferIOPlan *plan = &pf->plan;
-        InferPreadTask tasks[MAX_K];
+        InferPreadTask tasks[MAX_K] = {0};
         for (int k = 0; k < plan->K; k++) {
             tasks[k].fd = plan->fd;
             tasks[k].dst = plan->dst[k];
@@ -5060,7 +5256,7 @@ static void fused_layer_forward(
 
         // Check cache for each predicted expert, start async I/O for misses
         size_t spec_esz = active_expert_size();
-        if (g_malloc_cache) {
+        if (g_expert_cache_active && g_malloc_cache) {
             spec_group = dispatch_group_create();
             for (int k = 0; k < spec_K; k++) {
                 int eidx = s_spec_indices[k];
@@ -5081,7 +5277,7 @@ static void fused_layer_forward(
                     }
                 }
             }
-        } else if (g_expert_cache) {
+        } else if (g_expert_cache_active && g_expert_cache) {
             spec_group = dispatch_group_create();
             for (int k = 0; k < spec_K; k++) {
                 int eidx = s_spec_indices[k];
@@ -5167,7 +5363,7 @@ static void fused_layer_forward(
                 float sum_sq = 0.0f;
                 for (int i = 0; i < head_dim; i++) sum_sq += qh[i] * qh[i];
                 float inv_rms = 1.0f / sqrtf(sum_sq / head_dim + RMS_NORM_EPS);
-                for (int i = 0; i < head_dim; i++) qh[i] = qh[i] * inv_rms * bf16_to_f32(qnorm_w[i]);
+                for (int i = 0; i < head_dim; i++) qh[i] = qh[i] * inv_rms * (1.0f + bf16_to_f32(qnorm_w[i]));
             }
         }
         if (knorm_w) {
@@ -5176,7 +5372,7 @@ static void fused_layer_forward(
                 float sum_sq = 0.0f;
                 for (int i = 0; i < head_dim; i++) sum_sq += kh[i] * kh[i];
                 float inv_rms = 1.0f / sqrtf(sum_sq / head_dim + RMS_NORM_EPS);
-                for (int i = 0; i < head_dim; i++) kh[i] = kh[i] * inv_rms * bf16_to_f32(knorm_w[i]);
+                for (int i = 0; i < head_dim; i++) kh[i] = kh[i] * inv_rms * (1.0f + bf16_to_f32(knorm_w[i]));
             }
         }
 
@@ -5821,7 +6017,7 @@ static void fused_layer_forward(
             // Phase 2: parallel pread misses directly into cache buffers (zero-copy)
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
-                InferPreadTask tasks[MAX_K];
+                InferPreadTask tasks[MAX_K] = {0};
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     int cidx = miss_cache_idx[m];
@@ -5877,7 +6073,7 @@ static void fused_layer_forward(
             // Phase 2: parallel pread all cache misses
             if (num_misses > 0) {
                 size_t esz = active_expert_size();
-                InferPreadTask tasks[MAX_K];
+                InferPreadTask tasks[MAX_K] = {0};
                 for (int m = 0; m < num_misses; m++) {
                     int k = miss_indices[m];
                     tasks[m].fd = expert_pick_fd(layer_idx, expert_indices[k], packed_fd);
@@ -5937,7 +6133,7 @@ static void fused_layer_forward(
 
             // Parallel sync-pread misses into buf_A
             if (miss_count > 0) {
-                InferPreadTask tasks[MAX_K];
+                InferPreadTask tasks[MAX_K] = {0};
                 size_t esz = active_expert_size();
                 for (int m = 0; m < miss_count; m++) {
                     int k = miss_k_slots[m];
@@ -5956,7 +6152,7 @@ static void fused_layer_forward(
         } else if (g_use_lz4 && g_lz4_index[layer_idx]) {
             // ---- LZ4 compressed path: read compressed + decompress via io_pool ----
             size_t esz = active_expert_size();
-            InferPreadTask tasks[MAX_K];
+            InferPreadTask tasks[MAX_K] = {0};
             for (int k = 0; k < actual_K; k++) {
                 LZ4IndexEntry *ie = &g_lz4_index[layer_idx][expert_indices[k]];
                 tasks[k].fd = packed_fd;
@@ -6482,6 +6678,26 @@ static int extract_max_tokens(const char *buf, int default_val) {
     return atoi(p + 1);
 }
 
+static int extract_int_field(const char *buf, const char *field, int default_val) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", field);
+    const char *p = strstr(buf, needle);
+    if (!p) return default_val;
+    p = strchr(p, ':');
+    if (!p) return default_val;
+    return atoi(p + 1);
+}
+
+static float extract_float_field(const char *buf, const char *field, float default_val) {
+    char needle[64];
+    snprintf(needle, sizeof(needle), "\"%s\"", field);
+    const char *p = strstr(buf, needle);
+    if (!p) return default_val;
+    p = strchr(p, ':');
+    if (!p) return default_val;
+    return strtof(p + 1, NULL);
+}
+
 // Save a conversation turn to ~/.flash-moe/sessions/<session_id>.jsonl
 // Shared data store with the chat client.
 static void server_save_turn(const char *session_id, const char *role, const char *content) {
@@ -6642,6 +6858,44 @@ static PromptTokens *tokenize_continuation_turn(const char *user_content) {
     return pt;
 }
 
+static int request_has_tools(const char *body) {
+    return body && strstr(body, "\"tools\"") != NULL;
+}
+
+static const char *BASH_TOOL_SYSTEM_PROMPT =
+    "You are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\n\n"
+    "# Tools\n\n"
+    "You have access to the following functions:\n\n"
+    "<tools>\n"
+    "<function>\n"
+    "<name>bash</name>\n"
+    "<description>Run a shell command on the local machine.</description>\n"
+    "<parameters>\n"
+    "<parameter>\n"
+    "<name>command</name>\n"
+    "<type>string</type>\n"
+    "<description>Shell command to execute.</description>\n"
+    "</parameter>\n"
+    "<required>[\"command\"]</required>\n"
+    "</parameters>\n"
+    "</function>\n"
+    "</tools>\n\n"
+    "If you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+    "<tool_call>\n"
+    "<function=bash>\n"
+    "<parameter=command>\n"
+    "echo hello\n"
+    "</parameter>\n"
+    "</function>\n"
+    "</tool_call>\n\n"
+    "<IMPORTANT>\n"
+    "Reminder:\n"
+    "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n"
+    "- Required parameters MUST be specified\n"
+    "- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n"
+    "- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n"
+    "</IMPORTANT>";
+
 // Load custom system prompt from ~/.flash-moe/system.md, or use default
 static char *load_system_prompt(void) {
     const char *home = getenv("HOME");
@@ -6661,19 +6915,38 @@ static char *load_system_prompt(void) {
             return buf;
         }
     }
-    return strdup("You are a helpful assistant.");
+    return strdup("");
+}
+
+static char *build_system_prompt_text(const char *system_prompt_text) {
+    if (!system_prompt_text || !system_prompt_text[0]) {
+        return strdup("");
+    }
+    size_t sys_len = strlen(system_prompt_text);
+    size_t total = 32 + sys_len + 16;
+    char *prompt = malloc(total);
+    if (!prompt) return NULL;
+    snprintf(prompt, total, "<|im_start|>system\n%s<|im_end|>\n", system_prompt_text);
+    return prompt;
 }
 
 // Tokenize a full chat message (system prompt + user turn) for first-time use.
 static char *build_chat_message_text(const char *system_prompt_text, const char *user_content) {
-    size_t sys_len = strlen(system_prompt_text);
+    size_t sys_len = system_prompt_text ? strlen(system_prompt_text) : 0;
     size_t user_len = strlen(user_content);
-    size_t total = 30 + sys_len + 30 + user_len + 40;
+    int include_system = (system_prompt_text && system_prompt_text[0]);
+    size_t total = (include_system ? (30 + sys_len + 16) : 0) + 30 + user_len + 40;
     char *prompt = malloc(total);
     if (!prompt) return NULL;
-    snprintf(prompt, total,
-             "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
-             system_prompt_text, user_content);
+    if (include_system) {
+        snprintf(prompt, total,
+                 "<|im_start|>system\n%s<|im_end|>\n<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                 system_prompt_text, user_content);
+    } else {
+        snprintf(prompt, total,
+                 "<|im_start|>user\n%s<|im_end|>\n<|im_start|>assistant\n",
+                 user_content);
+    }
     return prompt;
 }
 
@@ -6692,7 +6965,6 @@ static PromptTokens *tokenize_chat_message(const char *user_content) {
 __attribute__((unused))
 static PromptTokens *tokenize_chat_message_old(const char *user_content) {
     const char *prefix =
-        "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
         "<|im_start|>user\n";
     const char *suffix = "<|im_end|>\n<|im_start|>assistant\n";
 
@@ -6767,7 +7039,13 @@ static void serve_loop(
     // Save the resulting KV cache + linear attention state as a snapshot.
     // On each request, restore the snapshot instead of re-prefilling.
     fprintf(stderr, "[serve] Pre-caching system prompt...\n");
-    PromptTokens *sys_pt = tokenize_chat_message("");  // empty user = just system prompt
+    char *serve_sys_prompt_text = load_system_prompt();
+    char *serve_sys_prompt_only = build_system_prompt_text(serve_sys_prompt_text);
+    runtime_dump_write_prompt_context("system_prefix",
+                                      "",
+                                      serve_sys_prompt_text,
+                                      serve_sys_prompt_only ? serve_sys_prompt_only : "");
+    PromptTokens *sys_pt = encode_prompt_text_to_tokens(serve_sys_prompt_only ? serve_sys_prompt_only : "");
     int sys_pos = 0;
     if (sys_pt && sys_pt->count > 0) {
         // Pre-embed all system prompt tokens
@@ -6826,6 +7104,8 @@ static void serve_loop(
         fprintf(stderr, "[serve] System prompt cached: %d tokens prefilled\n", sys_pos);
     }
     free(sys_pt);
+    free(serve_sys_prompt_only);
+    free(serve_sys_prompt_text);
 
     // Save snapshot of KV caches + linear attention state after system prompt
     // These are restored at the start of each request instead of resetting to zero
@@ -6960,6 +7240,20 @@ static void serve_loop(
             if (max_gen > 32768) max_gen = 32768;
             char req_session_id[64] = {0};
             int has_session = extract_session_id(body, req_session_id, sizeof(req_session_id));
+            int with_tools = request_has_tools(body);
+            float req_temperature = extract_float_field(body, "temperature", g_temperature);
+            float req_top_p = extract_float_field(body, "top_p", g_top_p);
+            int req_top_k = extract_int_field(body, "top_k", g_top_k);
+            int prev_do_sample = g_do_sample;
+            int prev_sampling_overridden = g_sampling_overridden;
+            float prev_temperature = g_temperature;
+            float prev_top_p = g_top_p;
+            int prev_top_k = g_top_k;
+            g_temperature = req_temperature;
+            g_top_p = req_top_p;
+            g_top_k = req_top_k > 0 ? req_top_k : g_top_k;
+            g_do_sample = (req_temperature > 0.0f);
+            g_sampling_overridden = 1;
 
             // Extract user content from messages (mutates body — must be last)
             char *content = extract_last_content(body);
@@ -6967,6 +7261,11 @@ static void serve_loop(
                 http_write_str(client_fd,
                     "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"no content in messages\"}\n");
+                g_do_sample = prev_do_sample;
+                g_sampling_overridden = prev_sampling_overridden;
+                g_temperature = prev_temperature;
+                g_top_p = prev_top_p;
+                g_top_k = prev_top_k;
                 free(reqbuf); close(client_fd); continue;
             }
             int is_continuation = (has_session &&
@@ -6993,15 +7292,23 @@ static void serve_loop(
                 pt = tokenize_continuation_turn(content);
                 free(full_prompt_text);
             } else {
-                char *full_prompt_text = build_user_turn_text(content);
+                char *full_prompt_text = with_tools
+                    ? build_chat_message_text(BASH_TOOL_SYSTEM_PROMPT, content)
+                    : build_user_turn_text(content);
                 runtime_dump_write_prompt_context("user_turn", content, "", full_prompt_text);
-                pt = tokenize_user_turn(content);
+                pt = with_tools ? encode_prompt_text_to_tokens(full_prompt_text)
+                                : tokenize_user_turn(content);
                 free(full_prompt_text);
             }
             if (!pt) {
                 http_write_str(client_fd,
                     "HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n"
                     "{\"error\":\"tokenization failed\"}\n");
+                g_do_sample = prev_do_sample;
+                g_sampling_overridden = prev_sampling_overridden;
+                g_temperature = prev_temperature;
+                g_top_p = prev_top_p;
+                g_top_k = prev_top_k;
                 free(reqbuf); close(client_fd); continue;
             }
             runtime_dump_write_prompt_tokens(pt);
@@ -7140,7 +7447,7 @@ static void serve_loop(
                 free(normed);
             }
             lm_head_forward(wf, hidden, logits);
-            int next_token = cpu_argmax(logits, VOCAB_SIZE);
+            int next_token = choose_next_token(logits, VOCAB_SIZE);
 
             // ---- Auto-regressive generation with SSE streaming ----
             if (g_pred_enabled) {
@@ -7185,7 +7492,7 @@ static void serve_loop(
                     }
                 }
 
-                const char *tok_str = decode_token(vocab, next_token);
+                const char *tok_str = should_skip_visible_token(next_token) ? "" : decode_token(vocab, next_token);
                 // Accumulate non-thinking response for session persistence
                 if (!in_think && tok_str && gen_resp_len + (int)strlen(tok_str) < 256*1024 - 1) {
                     int tlen = (int)strlen(tok_str);
@@ -7221,7 +7528,7 @@ static void serve_loop(
                     free(normed);
                 }
                 lm_head_forward(wf, hidden, logits);
-                next_token = cpu_argmax(logits, VOCAB_SIZE);
+                next_token = choose_next_token(logits, VOCAB_SIZE);
             }
 
             sse_send_done(client_fd, request_id);
@@ -7247,6 +7554,11 @@ static void serve_loop(
 
             free(pt->ids);
             free(pt);
+            g_do_sample = prev_do_sample;
+            g_sampling_overridden = prev_sampling_overridden;
+            g_temperature = prev_temperature;
+            g_top_p = prev_top_p;
+            g_top_k = prev_top_k;
             free(reqbuf);
             close(client_fd);
             continue;
@@ -7281,8 +7593,14 @@ static void print_usage(const char *prog) {
     printf("  --prompt TEXT         Prompt text (uses tokenizer.bin)\n");
     printf("  --tokens N           Max tokens to generate (default: 20)\n");
     printf("  --k N                Active experts per layer (default: 10)\n");
-    printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
+    printf("  --sample             Enable sampled decoding (default outside dump mode)\n");
+    printf("  --greedy             Force greedy decoding\n");
+    printf("  --temperature F      Sampling temperature (default: 1.0)\n");
+    printf("  --top-p F            Sampling nucleus threshold (default: 0.95)\n");
+    printf("  --decode-top-k N     Sampling top-k cutoff (default: 40)\n");
+    printf("  --cache-entries N    Expert LRU cache size (default: 0, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
+    printf("  --ram-lm-head        Copy BF16 lm_head into a dedicated Metal buffer\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -7299,6 +7617,12 @@ enum {
     OPT_DUMP_DIR = 1000,
     OPT_DUMP_LAYERS,
     OPT_DUMP_STAGES,
+    OPT_SAMPLE,
+    OPT_GREEDY,
+    OPT_TEMPERATURE,
+    OPT_TOP_P,
+    OPT_DECODE_TOP_K,
+    OPT_RAM_LM_HEAD,
 };
 
 int main(int argc, char **argv) {
@@ -7328,8 +7652,14 @@ int main(int argc, char **argv) {
             {"prompt",        required_argument, 0, 'P'},
             {"tokens",        required_argument, 0, 't'},
             {"k",             required_argument, 0, 'k'},
+            {"sample",        no_argument,       0, OPT_SAMPLE},
+            {"greedy",        no_argument,       0, OPT_GREEDY},
+            {"temperature",   required_argument, 0, OPT_TEMPERATURE},
+            {"top-p",         required_argument, 0, OPT_TOP_P},
+            {"decode-top-k",  required_argument, 0, OPT_DECODE_TOP_K},
             {"cache-entries",  required_argument, 0, 'C'},
             {"malloc-cache",   required_argument, 0, 'M'},
+            {"ram-lm-head",   no_argument,       0, OPT_RAM_LM_HEAD},
             {"cpu-linear",    no_argument,       0, 'L'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
@@ -7358,6 +7688,12 @@ int main(int argc, char **argv) {
                 case 'P': prompt_text = optarg; break;
                 case 't': max_tokens = atoi(optarg); break;
                 case 'k': K = atoi(optarg); break;
+                case OPT_SAMPLE: g_do_sample = 1; g_sampling_overridden = 1; break;
+                case OPT_GREEDY: g_do_sample = 0; g_sampling_overridden = 1; break;
+                case OPT_TEMPERATURE: g_temperature = strtof(optarg, NULL); g_sampling_overridden = 1; break;
+                case OPT_TOP_P: g_top_p = strtof(optarg, NULL); g_sampling_overridden = 1; break;
+                case OPT_DECODE_TOP_K: g_top_k = atoi(optarg); g_sampling_overridden = 1; break;
+                case OPT_RAM_LM_HEAD: g_ram_lm_head = 1; break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
@@ -7454,6 +7790,7 @@ int main(int argc, char **argv) {
         printf("K:        %d experts/layer\n", K);
         printf("Quant:    4-bit experts (%zu bytes each)\n", active_expert_size());
         printf("Linear:   %s\n", gpu_linear_attn_enabled ? "fused GPU delta-net" : "CPU/hybrid fallback");
+        printf("LM head:  %s\n", g_ram_lm_head ? "BF16 GPU matvec (dedicated buffer)" : "BF16 GPU matvec");
         printf("Tokens:   %d\n", max_tokens);
         if (g_malloc_cache) {
             printf("Cache:    malloc %d entries (%.1f GB)\n",
@@ -7470,6 +7807,31 @@ int main(int argc, char **argv) {
         if (!wf) {
             fprintf(stderr, "ERROR: Failed to load weights\n");
             return 1;
+        }
+
+        if (g_ram_lm_head) {
+            TensorInfo *lm_head_info = get_tensor_info(wf, "lm_head.weight");
+            if (!lm_head_info || strcmp(lm_head_info->dtype, "BF16") != 0) {
+                fprintf(stderr, "WARNING: --ram-lm-head requested but BF16 lm_head is unavailable\n");
+                g_ram_lm_head = 0;
+            } else if (!g_metal) {
+                fprintf(stderr, "WARNING: --ram-lm-head requested without Metal; falling back\n");
+                g_ram_lm_head = 0;
+            } else {
+                double t_lm = now_ms();
+                const uint16_t *lm_head_bf16 = (const uint16_t *)((char *)wf->data + lm_head_info->offset);
+                size_t bytes = (size_t)lm_head_info->shape[0] * (size_t)lm_head_info->shape[1] * sizeof(uint16_t);
+                g_lm_head_gpu_buf = [g_metal->device newBufferWithLength:bytes
+                                                                 options:MTLResourceStorageModeShared];
+                if (!g_lm_head_gpu_buf) {
+                    fprintf(stderr, "WARNING: failed to allocate dedicated lm_head buffer, falling back\n");
+                    g_ram_lm_head = 0;
+                } else {
+                    memcpy([g_lm_head_gpu_buf contents], lm_head_bf16, bytes);
+                    printf("[lm_head] Copied BF16 head into dedicated Metal buffer: %.2f GB in %.0f ms\n",
+                           bytes / 1e9, now_ms() - t_lm);
+                }
+            }
         }
 
         // Wrap weight file for Metal GPU access
@@ -7671,6 +8033,7 @@ int main(int argc, char **argv) {
         if (g_cache_telemetry_enabled) cache_telemetry_reset();
         printf("--- Generating %d tokens ---\n", max_tokens);
         int pos = 0;  // position counter for RoPE
+        g_expert_cache_active = 0;  // cache hurts TTFT; only enable during autoregressive generation
 
         // ---- Batch prefill: pre-embed all prompt tokens ----
         // Embedding all tokens upfront into a batch buffer avoids interleaving
@@ -7778,7 +8141,7 @@ int main(int argc, char **argv) {
         runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "logits", logits, runtime_vocab_size());
 
         // ---- Sample first token ----
-        int next_token = cpu_argmax(logits, VOCAB_SIZE);
+        int next_token = choose_next_token(logits, VOCAB_SIZE);
         runtime_dump_finish_step(next_token);
         double ttft_ms = now_ms() - t0;
 
@@ -7804,14 +8167,17 @@ int main(int argc, char **argv) {
                ttft_ms, pt->count, lm_ms);
 
         printf("\n--- Output ---\n");
-        printf("%s", decode_token(vocab, next_token));
-        fflush(stdout);
-
-        int total_generated = 1;
+        int total_generated = 0;
+        if (!should_skip_visible_token(next_token)) {
+            printf("%s", decode_token(vocab, next_token));
+            fflush(stdout);
+            total_generated = 1;
+        }
         int in_think = (next_token == g_special_tokens.think_start_token) ? 1 : 0;
         int think_tokens = 0;
 
         // ---- Auto-regressive generation ----
+        g_expert_cache_active = 1;
         if (g_timing_enabled) timing_reset();
         if (g_pred_enabled) {
             g_pred_generating = 1;  // enable prediction storage/use during generation
@@ -7863,8 +8229,7 @@ int main(int argc, char **argv) {
             runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "final_hidden", hidden, runtime_hidden_size());
             runtime_dump_write_f32_stage(DUMP_STAGE_FINAL, "logits", logits, runtime_vocab_size());
 
-            // Greedy sample
-            next_token = cpu_argmax(logits, VOCAB_SIZE);
+            next_token = choose_next_token(logits, VOCAB_SIZE);
             runtime_dump_finish_step(next_token);
 
             // Think budget: force end thinking if over budget
@@ -7872,11 +8237,11 @@ int main(int argc, char **argv) {
                 next_token = g_special_tokens.think_end_token;
                 in_think = 0;
             }
-            total_generated++;
-
-            // Print decoded token
-            printf("%s", decode_token(vocab, next_token));
-            fflush(stdout);
+            if (!should_skip_visible_token(next_token)) {
+                total_generated++;
+                printf("%s", decode_token(vocab, next_token));
+                fflush(stdout);
+            }
 
             double t_gen_end = now_ms();
             double tok_time = t_gen_end - t_gen_start;

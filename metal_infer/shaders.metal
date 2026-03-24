@@ -163,6 +163,47 @@ kernel void dequant_matvec_4bit_fast(
 }
 
 // ============================================================================
+// BF16 matrix-vector multiply
+//   out[out_dim] = W_bf16[out_dim, in_dim] * x[in_dim]
+// Optimized for small/medium in_dim (e.g. lm_head on Qwen3-Next: 2048)
+// ============================================================================
+
+kernel void bf16_matvec(
+    device const uint16_t* W         [[buffer(0)]],
+    device const float*    x         [[buffer(1)]],
+    device float*          out       [[buffer(2)]],
+    constant uint&         out_dim   [[buffer(3)]],
+    constant uint&         in_dim    [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    constexpr uint ROWS_PER_TG = 8;
+    uint row_base = tgid * ROWS_PER_TG;
+    uint simd_lane = lid & 31;
+    uint simd_group = lid >> 5;
+    uint row = row_base + simd_group;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += tg_size) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float acc = 0.0f;
+    if (row < out_dim) {
+        device const uint16_t *w_row = W + (size_t)row * in_dim;
+        for (uint i = simd_lane; i < in_dim; i += 32) {
+            acc += bf16_to_f32(w_row[i]) * x_shared[i];
+        }
+    }
+    acc = simd_sum(acc);
+    if (simd_lane == 0 && row < out_dim) {
+        out[row] = acc;
+    }
+}
+
+// ============================================================================
 // Fused gate+up+SwiGLU: reads x ONCE, computes silu(gate(x)) * up(x)
 // Saves one input read + one kernel dispatch per expert
 // ============================================================================
@@ -713,7 +754,7 @@ kernel void rms_norm_apply(
     if (tid >= dim) return;
 
     float rms = rsqrt(sum_sq[0] / float(dim) + eps);
-    out[tid] = x[tid] * rms * weight[tid];
+    out[tid] = x[tid] * rms * (1.0f + weight[tid]);
 }
 
 
@@ -736,7 +777,7 @@ kernel void rms_norm_apply_bf16(
     if (tid >= dim) return;
 
     float rms = rsqrt(sum_sq[0] / float(dim) + eps);
-    float w = bf16_to_f32(weight[tid]);
+    float w = 1.0f + bf16_to_f32(weight[tid]);
     out[tid] = x[tid] * rms * w;
 }
 

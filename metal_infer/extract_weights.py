@@ -239,7 +239,9 @@ def qwen3_next_extract(args: argparse.Namespace) -> int:
             if spec.kind == "quantize_matrix":
                 matrix = np.frombuffer(payload, dtype=np.uint16).reshape(record["shape"])
                 matrix = (matrix.astype(np.uint32) << 16).view(np.float32)
-                if spec.row_range is not None:
+                if spec.row_indices is not None:
+                    matrix = matrix[list(spec.row_indices), :]
+                elif spec.row_range is not None:
                     start_row, end_row = spec.row_range
                     matrix = matrix[start_row:end_row, :]
                 offset = emit_quantized_matrix(

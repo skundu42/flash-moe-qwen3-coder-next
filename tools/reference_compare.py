@@ -254,7 +254,7 @@ def ensure_layer_types(config: Dict, tensor_records: Dict[str, Dict]) -> None:
 
 def rms_norm_bf16(model_root: Path, tensor_records: Dict[str, Dict], tensor_name: str, x):
     np = require_numpy()
-    weight = read_bf16_full(model_root, tensor_records[tensor_name]).reshape(-1)
+    weight = read_bf16_full(model_root, tensor_records[tensor_name]).reshape(-1) + 1.0
     x = np.asarray(x, dtype=np.float32).reshape(-1)
     inv_rms = 1.0 / math.sqrt(float(np.mean(x * x)) + RMS_NORM_EPS)
     return (x * inv_rms * weight).astype(np.float32)

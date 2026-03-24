@@ -13,14 +13,20 @@ class TensorConversionSpec:
     target_name: str
     kind: str  # quantize_matrix | copy_bf16 | convert_bf16_to_f32
     row_range: Optional[Tuple[int, int]] = None
+    row_indices: Optional[Tuple[int, ...]] = None
 
 
 def build_qwen3_next_conversion_plan(runtime_config: dict) -> List[TensorConversionSpec]:
     plan: List[TensorConversionSpec] = []
     high_precision_moe_layers = int(runtime_config.get("high_precision_moe_layers", 0))
 
-    def q(src: str, dst: str, row_range: Optional[Tuple[int, int]] = None) -> None:
-        plan.append(TensorConversionSpec(src, dst, "quantize_matrix", row_range))
+    def q(
+        src: str,
+        dst: str,
+        row_range: Optional[Tuple[int, int]] = None,
+        row_indices: Optional[Tuple[int, ...]] = None,
+    ) -> None:
+        plan.append(TensorConversionSpec(src, dst, "quantize_matrix", row_range, row_indices))
 
     def bf16(src: str, dst: str) -> None:
         plan.append(TensorConversionSpec(src, dst, "copy_bf16"))
@@ -31,11 +37,59 @@ def build_qwen3_next_conversion_plan(runtime_config: dict) -> List[TensorConvers
     hidden = runtime_config["hidden_size"]
     linear_total_key = runtime_config["linear_total_key"]
     linear_total_value = runtime_config["linear_total_value"]
+    linear_num_key_heads = runtime_config["linear_num_key_heads"]
     linear_num_value_heads = runtime_config["linear_num_value_heads"]
+    linear_key_head_dim = runtime_config["linear_key_head_dim"]
+    linear_value_head_dim = runtime_config["linear_value_head_dim"]
     qkv_rows = linear_total_key * 2 + linear_total_value
+    value_heads_per_key = linear_num_value_heads // linear_num_key_heads
+
+    q_rows_per_group = linear_key_head_dim
+    k_rows_per_group = linear_key_head_dim
+    v_rows_per_group = value_heads_per_key * linear_value_head_dim
+    z_rows_per_group = v_rows_per_group
+    qkvz_rows_per_group = q_rows_per_group + k_rows_per_group + v_rows_per_group + z_rows_per_group
+
+    ba_b_rows_per_group = value_heads_per_key
+    ba_a_rows_per_group = value_heads_per_key
+    ba_rows_per_group = ba_b_rows_per_group + ba_a_rows_per_group
+
+    def grouped_row_indices(num_groups: int, block_size: int, block_offset: int, block_rows: int) -> List[int]:
+        rows: List[int] = []
+        for group_idx in range(num_groups):
+            base = group_idx * block_size + block_offset
+            rows.extend(range(base, base + block_rows))
+        return rows
+
+    q_rows = grouped_row_indices(linear_num_key_heads, qkvz_rows_per_group, 0, q_rows_per_group)
+    k_rows = grouped_row_indices(
+        linear_num_key_heads,
+        qkvz_rows_per_group,
+        q_rows_per_group,
+        k_rows_per_group,
+    )
+    v_rows = grouped_row_indices(
+        linear_num_key_heads,
+        qkvz_rows_per_group,
+        q_rows_per_group + k_rows_per_group,
+        v_rows_per_group,
+    )
+    z_rows = grouped_row_indices(
+        linear_num_key_heads,
+        qkvz_rows_per_group,
+        q_rows_per_group + k_rows_per_group + v_rows_per_group,
+        z_rows_per_group,
+    )
+    ba_b_rows = grouped_row_indices(linear_num_key_heads, ba_rows_per_group, 0, ba_b_rows_per_group)
+    ba_a_rows = grouped_row_indices(
+        linear_num_key_heads,
+        ba_rows_per_group,
+        ba_b_rows_per_group,
+        ba_a_rows_per_group,
+    )
 
     q("model.embed_tokens.weight", "model.embed_tokens")
-    q("lm_head.weight", "lm_head")
+    bf16("lm_head.weight", "lm_head.weight")
     bf16("model.norm.weight", "model.norm.weight")
 
     for layer_idx, layer_type in enumerate(runtime_config["layer_types"]):
@@ -57,22 +111,22 @@ def build_qwen3_next_conversion_plan(runtime_config: dict) -> List[TensorConvers
             q(
                 f"{prefix}.linear_attn.in_proj_qkvz.weight",
                 f"{prefix}.linear_attn.in_proj_qkv",
-                row_range=(0, qkv_rows),
+                row_indices=tuple(q_rows + k_rows + v_rows),
             )
             q(
                 f"{prefix}.linear_attn.in_proj_qkvz.weight",
                 f"{prefix}.linear_attn.in_proj_z",
-                row_range=(qkv_rows, qkv_rows + linear_total_value),
+                row_indices=tuple(z_rows),
             )
             q(
                 f"{prefix}.linear_attn.in_proj_ba.weight",
                 f"{prefix}.linear_attn.in_proj_b",
-                row_range=(0, linear_num_value_heads),
+                row_indices=tuple(ba_b_rows),
             )
             q(
                 f"{prefix}.linear_attn.in_proj_ba.weight",
                 f"{prefix}.linear_attn.in_proj_a",
-                row_range=(linear_num_value_heads, linear_num_value_heads * 2),
+                row_indices=tuple(ba_a_rows),
             )
             bf16(f"{prefix}.linear_attn.conv1d.weight", f"{prefix}.linear_attn.conv1d.weight")
             f32(f"{prefix}.linear_attn.A_log", f"{prefix}.linear_attn.A_log")

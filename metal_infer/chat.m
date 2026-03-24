@@ -184,7 +184,8 @@ static void generate_session_id(char *buf, size_t bufsize) {
              (int)getpid(), (long)tv.tv_sec, (int)tv.tv_usec);
 }
 
-static int send_chat_request(int port, const char *user_message, int max_tokens, const char *session_id) {
+static int send_chat_request(int port, const char *user_message, int max_tokens,
+                             const char *session_id, int tools_enabled) {
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) { perror("socket"); return -1; }
 
@@ -203,10 +204,23 @@ static int send_chat_request(int port, const char *user_message, int max_tokens,
     json_escape(user_message, escaped, sizeof(escaped));
 
     char body[MAX_INPUT_LINE * 3];
-    int body_len = snprintf(body, sizeof(body),
-        "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
-        "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
-        escaped, max_tokens, session_id);
+    int body_len;
+    if (tools_enabled) {
+        body_len = snprintf(body, sizeof(body),
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
+            "\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"bash\","
+            "\"description\":\"Run a shell command on the local machine.\","
+            "\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\","
+            "\"description\":\"Shell command to execute.\"}},\"required\":[\"command\"]}}}],"
+            "\"tool_choice\":\"auto\","
+            "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
+            escaped, max_tokens, session_id);
+    } else {
+        body_len = snprintf(body, sizeof(body),
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"%s\"}],"
+            "\"max_tokens\":%d,\"stream\":true,\"session_id\":\"%s\"}",
+            escaped, max_tokens, session_id);
+    }
 
     char request[MAX_INPUT_LINE * 4];
     int req_len = snprintf(request, sizeof(request),
@@ -254,6 +268,77 @@ static MdState g_md = {0, 0, 0, 0, 1, {0}, 0};
 static void md_reset(void) {
     memset(&g_md, 0, sizeof(g_md));
     g_md.line_start = 1;
+}
+
+typedef struct {
+    unsigned char tail[4];
+    int tail_len;
+} Utf8StreamState;
+
+static Utf8StreamState g_utf8 = {{0}, 0};
+
+static void utf8_reset(void) {
+    memset(&g_utf8, 0, sizeof(g_utf8));
+}
+
+static int utf8_seq_len(unsigned char c) {
+    if ((c & 0x80) == 0x00) return 1;
+    if ((c & 0xE0) == 0xC0) return 2;
+    if ((c & 0xF0) == 0xE0) return 3;
+    if ((c & 0xF8) == 0xF0) return 4;
+    return 1;
+}
+
+static size_t utf8_complete_prefix_len(const unsigned char *buf, size_t len) {
+    if (len == 0) return 0;
+    size_t i = len;
+    while (i > 0 && (buf[i - 1] & 0xC0) == 0x80) i--;
+    if (i == 0) {
+        if (len >= 4) return len;
+        return 0;
+    }
+    int seq_len = utf8_seq_len(buf[i - 1]);
+    size_t bytes_in_last_seq = len - (i - 1);
+    if ((size_t)seq_len <= bytes_in_last_seq) return len;
+    return i - 1;
+}
+
+static void utf8_print_chunk(const char *text, int dimmed) {
+    unsigned char buf[4096 + 4];
+    size_t text_len = strlen(text);
+    if (text_len + (size_t)g_utf8.tail_len > sizeof(buf)) {
+        text_len = sizeof(buf) - (size_t)g_utf8.tail_len;
+    }
+
+    size_t total = 0;
+    if (g_utf8.tail_len > 0) {
+        memcpy(buf, g_utf8.tail, (size_t)g_utf8.tail_len);
+        total += (size_t)g_utf8.tail_len;
+    }
+    if (text_len > 0) {
+        memcpy(buf + total, text, text_len);
+        total += text_len;
+    }
+
+    size_t complete = utf8_complete_prefix_len(buf, total);
+    if (complete > 0) {
+        if (dimmed) fputs(ANSI_DIM, stdout);
+        fwrite(buf, 1, complete, stdout);
+        if (dimmed) fputs(ANSI_RESET, stdout);
+    }
+
+    size_t remain = total - complete;
+    if (remain > sizeof(g_utf8.tail)) remain = sizeof(g_utf8.tail);
+    if (remain > 0) memcpy(g_utf8.tail, buf + complete, remain);
+    g_utf8.tail_len = (int)remain;
+}
+
+static void utf8_flush_tail(int dimmed) {
+    if (g_utf8.tail_len <= 0) return;
+    if (dimmed) fputs(ANSI_DIM, stdout);
+    fwrite(g_utf8.tail, 1, (size_t)g_utf8.tail_len, stdout);
+    if (dimmed) fputs(ANSI_RESET, stdout);
+    g_utf8.tail_len = 0;
 }
 
 static void md_print(const char *text) {
@@ -413,13 +498,14 @@ static void md_print(const char *text) {
 }
 
 // Stream SSE response, accumulate text, return malloc'd response string
-static char *stream_response(int sock, int show_thinking) {
+static char *stream_response(int sock, int show_thinking, int markdown_output) {
     FILE *stream = fdopen(sock, "r");
     if (!stream) { close(sock); return NULL; }
 
     int header_done = 0, in_think = 0, tokens = 0;
     double t_start = now_ms(), t_first = 0;
-    md_reset();  // fresh markdown state for each response
+    md_reset();    // fresh markdown state for each response
+    utf8_reset();  // fresh UTF-8 boundary state for each response
 
     char *response = calloc(1, MAX_RESPONSE);
     int resp_len = 0;
@@ -466,20 +552,25 @@ static char *stream_response(int sock, int show_thinking) {
         }
 
         if (in_think && !show_thinking) continue;
-        if (in_think) printf(ANSI_DIM "%s" ANSI_RESET, decoded);
-        else md_print(decoded);
+        if (markdown_output && !in_think) {
+            md_print(decoded);
+        } else {
+            utf8_print_chunk(decoded, in_think);
+        }
         fflush(stdout);
     }
     fclose(stream);
 
+    utf8_flush_tail(0);
     printf(ANSI_RESET);  // ensure no style leaks
+    double ttft_ms = t_first > 0 ? (t_first - t_start) : 0;
     double gen_time = t_first > 0 ? now_ms() - t_first : 0;
     int gen_tokens = tokens > 1 ? tokens - 1 : 0;
     printf("\n\n");
     if (gen_tokens > 0 && gen_time > 0)
         printf("[%d tokens, %.1f tok/s, TTFT %.1fs]\n\n",
                tokens, gen_tokens * 1000.0 / gen_time,
-               t_first > 0 ? (t_first - now_ms() + gen_time + (t_first - (now_ms() - gen_time))) / 1000.0 : 0);
+               ttft_ms / 1000.0);
 
     return response;
 }
@@ -492,12 +583,16 @@ int main(int argc, char **argv) {
     int port = 8000;
     int max_tokens = 8192;
     int show_thinking = 0;
+    int tools_enabled = 0;
+    int markdown_output = 0;
     const char *resume_id = NULL;
 
     static struct option long_options[] = {
         {"port",        required_argument, 0, 'p'},
         {"max-tokens",  required_argument, 0, 't'},
         {"show-think",  no_argument,       0, 's'},
+        {"tools",       no_argument,       0, 'T'},
+        {"markdown",    no_argument,       0, 'm'},
         {"resume",      required_argument, 0, 'r'},
         {"sessions",    no_argument,       0, 'l'},
         {"help",        no_argument,       0, 'h'},
@@ -507,11 +602,13 @@ int main(int argc, char **argv) {
     init_sessions_dir();
 
     int c;
-    while ((c = getopt_long(argc, argv, "p:t:sr:lh", long_options, NULL)) != -1) {
+    while ((c = getopt_long(argc, argv, "p:t:sTmr:lh", long_options, NULL)) != -1) {
         switch (c) {
             case 'p': port = atoi(optarg); break;
             case 't': max_tokens = atoi(optarg); break;
             case 's': show_thinking = 1; break;
+            case 'T': tools_enabled = 1; break;
+            case 'm': markdown_output = 1; break;
             case 'r': resume_id = optarg; break;
             case 'l': session_list(); return 0;
             case 'h':
@@ -519,6 +616,8 @@ int main(int argc, char **argv) {
                 printf("  --port N         Server port (default: 8000)\n");
                 printf("  --max-tokens N   Max response tokens (default: 8192)\n");
                 printf("  --show-think     Show <think> blocks (dimmed)\n");
+                printf("  --tools          Enable bash tool requests for this session\n");
+                printf("  --markdown       Enable ANSI markdown rendering\n");
                 printf("  --resume ID      Resume a previous session\n");
                 printf("  --sessions       List saved sessions\n");
                 printf("  --help           This message\n");
@@ -540,7 +639,9 @@ int main(int argc, char **argv) {
     printf("==================================================\n");
     printf("  Server:  http://localhost:%d\n", port);
     printf("  Session: %s%s\n", session_id, resume_id ? " (resumed)" : "");
-    printf("\n  Commands: /quit /exit /clear /sessions\n");
+    printf("  Tools:   %s\n", tools_enabled ? "enabled" : "disabled");
+    printf("  Output:  %s\n", markdown_output ? "markdown" : "plain");
+    printf("\n  Commands: /quit /exit /clear /sessions /tools on|off\n");
     printf("==================================================\n\n");
 
     // Health check
@@ -609,15 +710,25 @@ int main(int argc, char **argv) {
             session_list();
             continue;
         }
+        if (strcmp(input_line, "/tools on") == 0) {
+            tools_enabled = 1;
+            printf("[tools enabled]\n\n");
+            continue;
+        }
+        if (strcmp(input_line, "/tools off") == 0) {
+            tools_enabled = 0;
+            printf("[tools disabled]\n\n");
+            continue;
+        }
 
         // Save user turn
         session_save_turn(session_id, "user", input_line);
 
-        sock = send_chat_request(port, input_line, max_tokens, session_id);
+        sock = send_chat_request(port, input_line, max_tokens, session_id, tools_enabled);
         if (sock < 0) continue;
 
         printf("\n");
-        char *response = stream_response(sock, show_thinking);
+        char *response = stream_response(sock, show_thinking, markdown_output);
 
         // Save assistant turn
         if (response && strlen(response) > 0) {
@@ -625,8 +736,8 @@ int main(int argc, char **argv) {
         }
 
         // ---- Tool call handling ----
-        // Detect <tool_call>{"name":"bash","arguments":{"command":"..."}}
-        // Execute the command, feed output back as a continuation
+        // Detect <tool_call>...</tool_call>, execute bash command, feed output
+        // back as a continuation turn wrapped in <tool_response>...</tool_response>.
         while (response && strstr(response, "<tool_call>")) {
             char *tc_start = strstr(response, "<tool_call>");
             char *tc_end = strstr(tc_start, "</tool_call>");
@@ -667,7 +778,26 @@ int main(int argc, char **argv) {
                     }
                 }
             }
-            // Fallback: look for <arg_value>...</arg_value> (model's XML format)
+            // Preferred format: <parameter=command>\n...\n</parameter>
+            if (ci == 0) {
+                char *pv = strstr(tc_body, "<parameter=command>");
+                if (pv) {
+                    pv += strlen("<parameter=command>");
+                    while (*pv == '\n' || *pv == '\r') pv++;
+                    char *pv_end = strstr(pv, "</parameter>");
+                    if (pv_end) {
+                        int pvlen = (int)(pv_end - pv);
+                        while (pvlen > 0 && (pv[pvlen - 1] == '\n' || pv[pvlen - 1] == '\r' || pv[pvlen - 1] == ' ')) {
+                            pvlen--;
+                        }
+                        if (pvlen > 4095) pvlen = 4095;
+                        memcpy(command, pv, pvlen);
+                        ci = pvlen;
+                        command[ci] = 0;
+                    }
+                }
+            }
+            // Fallback: look for <arg_value>...</arg_value> (older XML-ish format)
             if (ci == 0) {
                 char *av = strstr(tc_body, "<arg_value>");
                 if (av) {
@@ -741,12 +871,12 @@ int main(int argc, char **argv) {
             snprintf(tool_msg, out_len + 256, "<tool_response>\n%s</tool_response>", output);
 
             free(response);
-            sock = send_chat_request(port, tool_msg, max_tokens, session_id);
+            sock = send_chat_request(port, tool_msg, max_tokens, session_id, 1);
             free(tool_msg);
             if (sock < 0) { response = NULL; break; }
 
             printf("\n");
-            response = stream_response(sock, show_thinking);
+            response = stream_response(sock, show_thinking, markdown_output);
 
             if (response && strlen(response) > 0) {
                 session_save_turn(session_id, "assistant", response);
